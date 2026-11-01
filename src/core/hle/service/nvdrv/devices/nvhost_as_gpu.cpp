@@ -151,7 +151,10 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     }
     nx2_device_ranges[{cpu_address, size}] = {device_address, heap};
     Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
-    gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+    // Keep replacements behind earlier command lists and unmaps of the same GPU range.
+    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
+        gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+    });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
 }
@@ -221,7 +224,10 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
         return;
     }
     nx2_sparse_ranges[gpu_address] = {size, device_address};
-    gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+    // Keep replacements behind earlier command lists and unmaps of the same GPU range.
+    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
+        gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+    });
     LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
               size, device_address);
 }
@@ -239,8 +245,13 @@ void nvhost_as_gpu::Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
     if (gpu_address + size > start + region_size) {
         return;
     }
-    system.Host1x().MemoryManager().Map(device_address + (gpu_address - start), cpu_address, size,
-                                        session->asid, true);
+    // The GPU may still be running command lists that touch this sparse range, so the SMMU
+    // mapping joins the same ordered queue as the surrounding map and unmap operations.
+    auto& smmu = system.Host1x().MemoryManager();
+    system.GPU().RunInOrder([&smmu, device_address = device_address + (gpu_address - start),
+                             cpu_address, size, asid = session->asid] {
+        smmu.Map(device_address, cpu_address, size, asid, true);
+    });
 }
 
 void nvhost_as_gpu::OnClose(DeviceFD fd) {}

@@ -441,8 +441,8 @@ private:
     }
 
     // Sub 211: job submission (nn::gpu::sdk job tracking). Word 2 is a constant id; word 17 is
-    // the job slot whose event (gpu TIPC 12) the SDK then waits on. Nothing runs here, so
-    // complete it at once.
+    // the job slot whose event (gpu TIPC 12) the SDK then waits on. Complete it after the
+    // queued mapping has been applied.
     void SubSubmitJob(HLERequestContext& ctx) {
         const auto* cmd_buf = ctx.CommandBuffer();
         const u32 slot = cmd_buf[17];
@@ -461,7 +461,7 @@ private:
         } else {
             LOG_WARNING(Service, "nx2:gpu 211 map of unknown handle {}", handle);
         }
-        EventFor(slot)->Signal(system.Kernel());
+        SignalAfterGpu(slot);
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -562,7 +562,7 @@ private:
         } else {
             LOG_WARNING(Service, "nx2:gpu 214 unexpected region [{:#x}, {:#x}]", start, last);
         }
-        EventFor(slot)->Signal(system.Kernel());
+        SignalAfterGpu(slot);
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
