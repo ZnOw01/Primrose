@@ -412,7 +412,13 @@ private:
         const u64 last = u64{b[4]} | (u64{b[5]} << 32);
         LOG_DEBUG(Service, "nx2:gpu sub 101 start={:#x} last={:#x} [6]={:#x} [7]={:#x}", start,
                     last, b[6], b[7]);
-        if (last > start) {
+        if (!Nvidia::Devices::Nx2GpuMemoryRegistry::IsValidInclusiveRange(start, last) ||
+            !system.ApplicationProcess()->GetPageTable().Contains(start, last - start + 1)) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.PushRaw<u32>(Kernel::ResultInvalidAddress.raw);
+            return;
+        }
+        {
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Register(start, last - start + 1);
             // Two-page regions hold queue semaphores: GPU releases go to the second page, waits
             // read the first (see video_core/nx2.h).
@@ -453,13 +459,19 @@ private:
         const u32 handle = cmd_buf[7];
         LOG_DEBUG(Service, "nx2:gpu 211 map [{:#x}, {:#x}] handle={} offset={:#x} slot={}", a, b,
                  handle, c, slot);
-        if (const auto it = m_memory.find(handle); it != m_memory.end() && b > a) {
+        const auto it = m_memory.find(handle);
+        if (it == m_memory.end() ||
+            !Nvidia::Devices::Nx2GpuMemoryRegistry::IsValidInclusiveRange(a, b) ||
+            c > it->second.size || b - a + 1 > it->second.size - c || (c & 0xfff) != 0) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultInvalidAddress);
+            return;
+        }
+        {
             // Also at the memory's own address: an earlier 213 may have unmapped the mapping 101
             // made there.
             const u64 cpu = it->second.address + c;
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(a, cpu, b - a + 1);
-        } else {
-            LOG_WARNING(Service, "nx2:gpu 211 map of unknown handle {}", handle);
         }
         EventFor(slot)->Signal(system.Kernel());
         IPC::ResponseBuilder rb{ctx, 2};
@@ -487,6 +499,11 @@ private:
         const u64 first = u64{w[3]} | (u64{w[4]} << 32);
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
         LOG_DEBUG(Service, "nx2:gpu 213 unmap [{:#x}, {:#x}] slot={}", first, last, w[8]);
+        if (!Nvidia::Devices::Nx2GpuMemoryRegistry::IsValidInclusiveRange(first, last)) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultInvalidAddress);
+            return;
+        }
         if (last > first) {
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
         }
@@ -538,7 +555,12 @@ private:
         const u32 slot = w[11];
         LOG_DEBUG(Service, "nx2:gpu 214 words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
                  w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
-        if (last > start && ((last + 1 - start) % Core::Memory::YUZU_PAGESIZE) == 0) {
+        if (!Nvidia::Devices::Nx2GpuMemoryRegistry::IsValidInclusiveRange(start, last)) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultInvalidAddress);
+            return;
+        }
+        {
             const u64 size = last + 1 - start;
             std::scoped_lock lk{m_region_mutex};
             FreeReleasedRegions();
@@ -559,8 +581,6 @@ private:
                                   "({} MiB of GPU-only memory in use, peak {} MiB)",
                          start, last, *address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
             }
-        } else {
-            LOG_WARNING(Service, "nx2:gpu 214 unexpected region [{:#x}, {:#x}]", start, last);
         }
         EventFor(slot)->Signal(system.Kernel());
         IPC::ResponseBuilder rb{ctx, 2};
@@ -577,6 +597,11 @@ private:
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
         LOG_DEBUG(Service, "nx2:gpu 215 destroy sparse region [{:#x}, {:#x}] words {:#x} {:#x} {:#x} {:#x}",
                  first, last, w[1], w[2], w[7], w[8]);
+        if (!Nvidia::Devices::Nx2GpuMemoryRegistry::IsValidInclusiveRange(first, last)) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultInvalidAddress);
+            return;
+        }
         std::scoped_lock lk{m_region_mutex};
         FreeReleasedRegions();
         if (last > first) {

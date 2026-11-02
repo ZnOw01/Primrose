@@ -129,6 +129,12 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
                   gpu_address, size);
         return;
     }
+    if (!Nx2GpuMemoryRegistry::IsValidRange(gpu_address, size) ||
+        !Nx2GpuMemoryRegistry::IsValidRange(cpu_address, size) ||
+        !gmmu->IsWithinGPUAddressRange(gpu_address, size)) {
+        LOG_ERROR(Service_NVDRV, "Invalid Switch 2 GPU mapping {:#x}+{:#x}", gpu_address, size);
+        return;
+    }
     // The same CPU range is often mapped twice (at its own address and in a sparse region), so
     // reuse its SMMU mapping.
     DAddr device_address{};
@@ -158,7 +164,8 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
 
 void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
     std::scoped_lock lock(mutex);
-    if (!gmmu) {
+    if (!gmmu || !Nx2GpuMemoryRegistry::IsValidRange(gpu_address, size) ||
+        !gmmu->IsWithinGPUAddressRange(gpu_address, size)) {
         return;
     }
     // The GPU thread may still be running command lists that use the range.
@@ -193,7 +200,8 @@ void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
 
 void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
     std::scoped_lock lock(mutex);
-    if (!gmmu) {
+    if (!gmmu || !Nx2GpuMemoryRegistry::IsValidRange(gpu_address, size) ||
+        !gmmu->IsWithinGPUAddressRange(gpu_address, size)) {
         return;
     }
     auto& smmu = system.Host1x().MemoryManager();
@@ -236,7 +244,8 @@ void nvhost_as_gpu::Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
     --it;
     const auto& [start, range] = *it;
     const auto& [region_size, device_address] = range;
-    if (gpu_address + size > start + region_size) {
+    if (!Nx2GpuMemoryRegistry::IsValidRange(cpu_address, size) ||
+        gpu_address - start >= region_size || size > region_size - (gpu_address - start)) {
         return;
     }
     system.Host1x().MemoryManager().Map(device_address + (gpu_address - start), cpu_address, size,

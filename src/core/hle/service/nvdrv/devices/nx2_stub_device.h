@@ -50,11 +50,24 @@ public:
         return registry;
     }
 
+    // The user GPU partition advertised by nx2:gpu has an exclusive upper bound.
+    static constexpr u64 AddressSpaceEnd = 0xC000000000ULL;
+    static constexpr bool IsValidRange(u64 address, u64 size) {
+        return size != 0 && address < AddressSpaceEnd && size <= AddressSpaceEnd - address &&
+               (address & 0xfff) == 0 && (size & 0xfff) == 0;
+    }
+    static constexpr bool IsValidInclusiveRange(u64 first, u64 last) {
+        return last >= first && last < AddressSpaceEnd && IsValidRange(first, last - first + 1);
+    }
+
     void Register(u64 address, u64 size) {
         MapAt(address, address, size);
     }
 
     void MapAt(u64 gpu_address, u64 cpu_address, u64 size) {
+        if (!IsValidRange(gpu_address, size) || !IsValidRange(cpu_address, size)) {
+            return;
+        }
         std::scoped_lock lk{mutex};
         TrimMappings(gpu_address, size);
         mappings.push_back({gpu_address, cpu_address, size});
@@ -65,6 +78,9 @@ public:
 
     // NormalUnmapGpuMemory4K, or destroying the memory: the GPU range stops reaching it.
     void Unmap(u64 gpu_address, u64 size) {
+        if (!IsValidRange(gpu_address, size)) {
+            return;
+        }
         std::scoped_lock lk{mutex};
         TrimMappings(gpu_address, size);
         for (auto& [owner, listener] : listeners) {
@@ -92,6 +108,9 @@ public:
     // The GPU mapping never changes, so the texture cache doesn't rebuild the images over it as
     // blocks get memory; unbacked blocks read zero.
     void CreateSparse(u64 gpu_address, u64 size) {
+        if (!IsValidRange(gpu_address, size)) {
+            return;
+        }
         std::scoped_lock lk{mutex};
         sparse_regions[gpu_address] = size;
         for (auto& [owner, listener] : listeners) {
@@ -102,6 +121,9 @@ public:
     }
 
     void DestroySparse(u64 gpu_address, u64 size) {
+        if (!IsValidRange(gpu_address, size)) {
+            return;
+        }
         std::scoped_lock lk{mutex};
         sparse_regions.erase(gpu_address);
         for (auto& [owner, listener] : listeners) {

@@ -158,6 +158,12 @@ public:
         return gpu_addr < address_space_size;
     }
 
+    /// Validate the entire range before indexing or modifying GPU page tables.
+    bool IsWithinGPUAddressRange(GPUVAddr gpu_addr, u64 size) const {
+        return size != 0 && gpu_addr < address_space_size &&
+               size <= address_space_size - gpu_addr;
+    }
+
     PTEKind GetPageKind(GPUVAddr gpu_addr) const;
 
     size_t GetMemoryLayoutSize(GPUVAddr gpu_addr,
