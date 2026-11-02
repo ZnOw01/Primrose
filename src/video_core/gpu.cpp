@@ -121,7 +121,9 @@ struct GPU::Impl {
 
     /// Signal the ending of command list.
     void OnCommandListEnd() {
-        renderer->ReadRasterizer()->ReleaseFences(false);
+        // Wait for the pending fences: the decoder writes its output right after this point and
+        // must not race fences that are still in flight.
+        renderer->ReadRasterizer()->ReleaseFences(true);
         Settings::UpdateGPUAccuracy();
     }
 
