@@ -1770,19 +1770,31 @@ private:
                 continue;
             }
             if (!m_decoded.empty() && !m_free.empty()) {
+                const u32 image = m_free.front();
+                if (const auto it = m_release_fences.find(image); it != m_release_fences.end()) {
+                    const Fence fence = it->second;
+                    lk.unlock();
+                    const bool released = WaitForRelease(fence);
+                    lk.lock();
+                    // A timeout does not give us ownership of the image. Keep both queues in
+                    // order and retry, without publishing a frame or advancing its syncpoint.
+                    // Recheck state changed by stop, teardown or unregister while unlocked.
+                    if (!released || m_quit || m_flush || m_free.empty() ||
+                        m_free.front() != image) {
+                        continue;
+                    }
+                    const auto current = m_release_fences.find(image);
+                    if (current == m_release_fences.end() ||
+                        current->second.syncpoint != fence.syncpoint ||
+                        current->second.value != fence.value) {
+                        continue;
+                    }
+                    m_release_fences.erase(current);
+                }
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
-                const u32 image = m_free.front();
                 m_free.pop_front();
-                std::optional<Fence> fence;
-                if (const auto it = m_release_fences.find(image); it != m_release_fences.end()) {
-                    fence = it->second;
-                    m_release_fences.erase(it);
-                }
                 lk.unlock();
-                if (fence) {
-                    WaitForRelease(*fence);
-                }
                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
@@ -1830,16 +1842,20 @@ private:
     }
 
     // Waits (bounded) until the client's reads of an image it gave back have passed.
-    void WaitForRelease(const Fence& fence) {
+    // A false result leaves the image owned by the client and must not permit a write.
+    bool WaitForRelease(const Fence& fence) {
         if (fence.syncpoint >= HostSyncpoints) {
-            return;
+            return true;
         }
         auto& syncpoints = system.Host1x().GetSyncpointManager();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{100};
-        while (!syncpoints.IsReadyGuest(fence.syncpoint, fence.value) &&
-               std::chrono::steady_clock::now() < deadline) {
+        while (!syncpoints.IsReadyGuest(fence.syncpoint, fence.value)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds{1});
         }
+        return true;
     }
 
     // Writes a decoded frame into an output image; returns the size the frame reports.
