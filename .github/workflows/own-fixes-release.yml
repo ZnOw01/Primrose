@@ -1,0 +1,139 @@
+name: own-fixes-release
+
+run-name: Own fixes ${{ github.ref_name }} (${{ github.sha }})
+
+on:
+  push:
+    branches: [nx2-experimental-own-fixes]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: own-fixes-release-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'ZnOw01/Primrose' && github.ref == 'refs/heads/nx2-experimental-own-fixes'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - name: Identify the exact build
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="own-fixes-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: prepare
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      sha: ${{ github.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+      refspec: nx2-experimental-own-fixes
+      tag: ${{ needs.prepare.outputs.tag }}
+      release: false
+      nightly: true
+      pgo: none
+
+  windows:
+    needs: prepare
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      sha: ${{ github.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+      refspec: nx2-experimental-own-fixes
+      tag: ${{ needs.prepare.outputs.tag }}
+      release: false
+      nightly: true
+      pgo: none
+
+  macos:
+    needs: prepare
+    uses: ./.github/workflows/build-macos.yml
+    with:
+      sha: ${{ github.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+      refspec: nx2-experimental-own-fixes
+      tag: ${{ needs.prepare.outputs.tag }}
+      release: false
+      nightly: true
+      runner: ${{ vars.MACOS_RUNNER || 'macos-26' }}
+
+  publish:
+    needs: [prepare, linux, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Download this run's binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: eglantine-*-${{ github.sha }}
+          path: artifacts
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          python3 - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+
+          sha = os.environ['GITHUB_SHA']
+          folders = sorted(Path('artifacts').iterdir())
+          if not folders:
+              raise SystemExit('No build artifacts downloaded')
+          for folder in folders:
+              packages = sorted(p for p in folder.iterdir()
+                                if p.name.endswith(('.AppImage', '.tar.gz', '.zip', '.dmg')))
+              if packages:
+                  for package in packages:
+                      shutil.copy2(package, Path('release-assets') / package.name.replace('-' + sha, ''))
+              else:
+                  name = folder.name.replace('-' + sha, '')
+                  shutil.make_archive(str(Path('release-assets') / name), 'zip', folder)
+          if not any(Path('release-assets').iterdir()):
+              raise SystemExit('No release assets packaged')
+          PY
+
+      - name: Publish an own-fixes prerelease and tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Own-fixes build of `%s` at `%s`.\n\nBuilt automatically from a push to the personal experimental branch. Not an upstream stable release.\n' \
+            "$GITHUB_REF_NAME" "$GITHUB_SHA" > notes.md
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            actual=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')
+            test "$actual" = "$GITHUB_SHA"
+            gh release upload "$TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Eglantine experimental own fixes $TAG" \
+              --notes-file notes.md --prerelease --latest=false
+          fi
+          actual=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')
+          test "$actual" = "$GITHUB_SHA"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets > published-assets.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          expected = {p.name: p.stat().st_size for p in Path('release-assets').iterdir()}
+          published = {a['name']: a['size'] for a in json.loads(Path('published-assets.json').read_text())['assets']}
+          if expected != published:
+              raise SystemExit(f'Release assets differ: expected {expected}, published {published}')
+          PY
