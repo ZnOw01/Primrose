@@ -37,7 +37,7 @@ commits() { git log --no-merges --pretty='- %s (`%h`)' "$@" 2>/dev/null | head -
       printf '%s\n\n' "$section"
       ;;
     daily)
-      printf 'Automatic daily build of `nx2` at `%s`.\n\n## Changes since the previous daily build\n\n' "$short"
+      printf 'Automatic daily build of `%s` at `%s`.\n\n## Changes since the previous daily build\n\n' "${BRANCH:-nx2}" "$short"
       if [[ -n "${PREV_TAG:-}" ]]; then commits "$PREV_TAG..$sha"; else commits -n 30 "$sha"; fi
       printf '\n'
       ;;
@@ -60,7 +60,7 @@ commits() { git log --no-merges --pretty='- %s (`%h`)' "$@" 2>/dev/null | head -
     cat <<'EOF2'
 ## Linux
 
-The AppImage is self-contained (needs glibc 2.39 or newer: Ubuntu 24.04, Fedora 40, Debian 13, Arch): make it executable with `chmod +x` and run it. The tar.gz uses your system libraries, so Qt 6 and the usual libraries must be installed.
+The AppImage is self-contained (needs glibc 2.39 or newer: Ubuntu 24.04, Fedora 40, Debian 13, Arch): make it executable with `chmod +x` and run it. The tar.gz uses your system Qt and needs Qt 6.8 or newer (Arch, Fedora 41, Debian 13, Ubuntu 25.04 or newer). On Ubuntu 24.04, use the AppImage.
 
 | Build Type | Standard | PGO (Recommended) | Notes |
 | --- | --- | --- | --- |
