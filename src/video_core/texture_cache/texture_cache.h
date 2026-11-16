@@ -1403,6 +1403,16 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
+        if constexpr (requires { &Image::ResetTiles; }) {
+            // A Switch 2 game unmapping one tile of a large sparse texture (title 1's 16384x16384
+            // R8 pair, ~160 times a session) deleted the whole image, and re-creating it (a sparse
+            // image bound block by block to a zeroed block, then waited on) stalled ~0.75 s each on
+            // AMD. The image stays; its tiles are brought up to date before its next use.
+            if (True(image.flags & ImageFlagBits::SparseTiles) && image.SparseTilesShareZeroBlock()) {
+                image.flags |= ImageFlagBits::SparseTilesUnmapped;
+                continue;
+            }
+        }
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, id);
         }
@@ -2422,6 +2432,40 @@ void TextureCache<P>::ForEachWrittenRange(Image& image, ImageId image_id, DAddr 
         return;
     }
     func(begin - image.cpu_addr, end - begin);
+}
+
+template <class P>
+void TextureCache<P>::RefreshUnmappedSparseTiles(Image& image, ImageId image_id) {
+    image.flags &= ~ImageFlagBits::SparseTilesUnmapped;
+    if constexpr (requires { &Image::ResetTiles; }) {
+        // Its views of guest memory are made again from the mappings now, its blocks go back to
+        // the zeroed one, and every tile mapped now is loaded: what a new image would get.
+        const bool tracked = True(image.flags & ImageFlagBits::Tracked);
+        if (tracked) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(image));
+        if (!image.ResetTiles()) {
+            LOG_WARNING(HW_GPU, "Sparse tiled image {:#x}: could not reset its blocks",
+                        image.gpu_addr);
+            // Retried on the next use.
+            image.flags |= ImageFlagBits::SparseTilesUnmapped;
+        }
+        RegisterImage(image_id);
+        if (tracked) {
+            TrackImage(image, image_id);
+        }
+        image.dirty_ranges.clear();
+        image.flags |= ImageFlagBits::CpuModified;
+        ++sparse_tiles_refreshed;
+        static u32 logged{};
+        if (logged++ < 16 || (sparse_tiles_refreshed & 63) == 0) {
+            LOG_INFO(HW_GPU,
+                     "Sparse tiled image {:#x}: tiles unmapped, reloaded in place ({} so far)",
+                     image.gpu_addr, sparse_tiles_refreshed);
+        }
+    }
 }
 
 template <class P>
@@ -4493,6 +4537,9 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
 template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
     Image& image = slot_images[image_id];
+    if (True(image.flags & ImageFlagBits::SparseTilesUnmapped)) [[unlikely]] {
+        RefreshUnmappedSparseTiles(image, image_id);
+    }
     if (!is_modification && !invalidate &&
         False(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Alias))) [[likely]] {
         lru_cache.Touch(image.lru_index, frame_tick);
