@@ -70,6 +70,7 @@ jobs:
   publish:
     needs: [prepare, linux, windows, macos]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
     env:
@@ -107,33 +108,106 @@ jobs:
                   shutil.make_archive(str(Path('release-assets') / name), 'zip', folder)
           if not any(Path('release-assets').iterdir()):
               raise SystemExit('No release assets packaged')
+          required = {
+              'eglantine-linux-x86_64.AppImage',
+              'eglantine-linux-x86_64.tar.gz',
+              'eglantine-linux-aarch64.AppImage',
+              'eglantine-linux-aarch64.tar.gz',
+              'eglantine-windows-x86_64.zip',
+              'eglantine-macos-arm64.zip',
+              'eglantine-macos-arm64.dmg',
+          }
+          files = [p for p in Path('release-assets').iterdir() if p.is_file()]
+          actual = {p.name for p in files}
+          if actual != required:
+              missing = sorted(required - actual)
+              extra = sorted(actual - required)
+              raise SystemExit(f'Release assets differ: missing {missing}, extra {extra}')
+          empty = sorted(p.name for p in files if p.stat().st_size == 0)
+          if empty:
+              raise SystemExit(f'Release assets are empty: {empty}')
           PY
 
       - name: Publish an own-fixes prerelease and tag
         shell: bash
         run: |
           set -euo pipefail
+          error_file=$(mktemp)
+          trap 'rm -f "$error_file"' EXIT
+          if actual=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha' 2>"$error_file"); then
+            if [ "$actual" != "$GITHUB_SHA" ]; then
+              echo "Release tag $TAG points to $actual instead of $GITHUB_SHA"
+              exit 1
+            fi
+          elif ! grep -Fq 'HTTP 404' "$error_file"; then
+            cat "$error_file" >&2
+            exit 1
+          fi
           printf 'Own-fixes build of `%s` at `%s`.\n\nBuilt automatically from a push to the personal experimental branch. Not an upstream stable release.\n' \
             "$GITHUB_REF_NAME" "$GITHUB_SHA" > notes.md
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            actual=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')
-            test "$actual" = "$GITHUB_SHA"
-            gh release upload "$TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            gh release create "$TAG" release-assets/* \
-              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$error_file"; then
+            :
+          elif grep -Fxq 'release not found' "$error_file"; then
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" \
               --title "Eglantine experimental own fixes $TAG" \
-              --notes-file notes.md --prerelease --latest=false
+              --notes-file notes.md --prerelease --latest=false --repo "$GITHUB_REPOSITORY"
+          else
+            cat "$error_file" >&2
+            exit 1
           fi
-          actual=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')
-          test "$actual" = "$GITHUB_SHA"
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets > published-assets.json
+
+      - name: Reconcile and publish the release
+        shell: bash
+        env:
+          ASSET_DIR: release-assets
+        run: |
+          set -euo pipefail
+          title="Eglantine experimental own fixes $TAG"
+          export TITLE="$title"
+          gh release edit "$TAG" --title "$TITLE" --notes-file notes.md --prerelease --repo "$GITHUB_REPOSITORY"
           python3 - <<'PY'
           import json
-          from pathlib import Path
+          import os
+          import pathlib
+          import subprocess
 
-          expected = {p.name: p.stat().st_size for p in Path('release-assets').iterdir()}
-          published = {a['name']: a['size'] for a in json.loads(Path('published-assets.json').read_text())['assets']}
-          if expected != published:
-              raise SystemExit(f'Release assets differ: expected {expected}, published {published}')
+          repo, tag, title = os.environ['GITHUB_REPOSITORY'], os.environ['TAG'], os.environ['TITLE']
+          assets = pathlib.Path(os.environ['ASSET_DIR'])
+          def read_release():
+              result = subprocess.run(
+                  ['gh', 'release', 'view', tag, '--repo', repo, '--json', 'assets,isDraft,isPrerelease,tagName,name'],
+                  check=True, capture_output=True, text=True,
+              )
+              return json.loads(result.stdout)
+          published = read_release()
+          have = {a['name']: a['size'] for a in published['assets']}
+          expected = {p.name: p.stat().st_size for p in assets.iterdir() if p.is_file()}
+          upload = [str(p) for p in assets.iterdir() if p.is_file() and have.get(p.name) != p.stat().st_size]
+          if upload:
+              subprocess.run(['gh', 'release', 'upload', tag, *upload, '--clobber', '--repo', repo], check=True)
+              published = read_release()
+              have = {a['name']: a['size'] for a in published['assets']}
+          if expected != have:
+              missing = sorted(set(expected) - set(have))
+              extra = sorted(set(have) - set(expected))
+              raise SystemExit(f'Release assets differ: missing {missing}, extra {extra}')
+          if any(size == 0 for size in have.values()):
+              raise SystemExit(f'Release has empty assets: {sorted(name for name, size in have.items() if size == 0)}')
+          if published['isDraft']:
+              subprocess.run(['gh', 'release', 'edit', tag, '--draft=false', '--repo', repo], check=True)
+              published = read_release()
+              have = {a['name']: a['size'] for a in published['assets']}
+          if published['isDraft']:
+              raise SystemExit('Release is still a draft')
+          if not published['isPrerelease']:
+              raise SystemExit('Release is not a prerelease')
+          if published['tagName'] != tag:
+              raise SystemExit(f'Release tag is {published["tagName"]}, expected {tag}')
+          if published['name'] != title:
+              raise SystemExit(f'Release title is {published["name"]!r}, expected {title!r}')
+          if expected != have:
+              missing = sorted(set(expected) - set(have))
+              extra = sorted(set(have) - set(expected))
+              raise SystemExit(f'Release assets differ after publishing: missing {missing}, extra {extra}')
           PY
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')" = "$GITHUB_SHA"
