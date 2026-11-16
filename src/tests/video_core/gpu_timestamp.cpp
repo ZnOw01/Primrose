@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -105,4 +108,14 @@ TEST_CASE("Maxwell retains its tick units and clock scaling", "[video_core][gpu_
                                             present_ns) == ticks / 512);
         }
     }
+}
+
+TEST_CASE("Mario Kart World keeps GPU tick timestamps", "[video_core][gpu_timestamp]") {
+    REQUIRE(Tegra::UsesLegacyAmpereTimestamps(0x0400C3F00006E000ULL));
+    REQUIRE_FALSE(Tegra::UsesLegacyAmpereTimestamps(0));
+    REQUIRE_FALSE(Tegra::UsesLegacyAmpereTimestamps(0x0400486024DEC000ULL)); // Ocarina of Time
+    // The legacy path is the non-ampere one: GPU ticks over the clock setting's divisor.
+    constexpr u64 Ns = 293'036'000'000'000;
+    REQUIRE(Tegra::ReadGpuTimestamp(At(Ns), false, Settings::GpuClock::Boost, Ns) ==
+            At(Ns).gpu_ticks / 256);
 }

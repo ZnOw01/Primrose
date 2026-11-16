@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -19,6 +22,7 @@
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "common/progress_counter.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
@@ -122,6 +126,17 @@ public:
 
     void NoteRenderPassStores() {
         render_pass_has_stores = true;
+        storage_writes_unordered = true;
+    }
+
+    /// A draw wrote storage since the last memory barrier after all graphics stages: a host
+    /// indirect draw reading GPU-written arguments needs one first (ReadyIndirectRecord).
+    bool StorageWritesUnordered() const {
+        return storage_writes_unordered;
+    }
+
+    void NoteStorageWritesOrdered() {
+        storage_writes_unordered = false;
     }
 
     bool RenderPassHasStores() const {
@@ -304,6 +319,8 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    /// The master semaphore's current tick as of the last submission (WaitSubmitted waits on it).
+    Common::ProgressCounter submitted_ticks;
 
     class Command {
     public:
@@ -436,6 +453,7 @@ private:
     std::unique_ptr<MasterSemaphore> master_semaphore;
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    bool storage_writes_unordered{};
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;

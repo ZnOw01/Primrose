@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -542,6 +545,15 @@ void StartFromEnvironment() {
             auto& state = GetState();
             std::scoped_lock lock{state.mutex};
             state.min_ms = ms;
+        }
+        // EDEN_NX2_SPIKES_RATIO=<x>: a spike must also be x times the median (default 2).
+        if (const char* const ratio = std::getenv("EDEN_NX2_SPIKES_RATIO"); ratio != nullptr) {
+            const double value_ratio = std::atof(ratio);
+            if (value_ratio > 0.0) {
+                auto& state = GetState();
+                std::scoped_lock lock{state.mutex};
+                state.ratio = value_ratio;
+            }
         }
         SetEnabled(true);
     });

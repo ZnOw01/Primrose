@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -99,7 +102,7 @@ void ConfigureGeneral::Setup(const ConfigurationShared::Builder& builder) {
         if (is_update_channel) {
             widget->setToolTip(widget->toolTip() + QStringLiteral("\n\n") +
                                tr("Installed version: %1")
-                                   .arg(QString::fromUtf8(Common::g_build_version)));
+                                   .arg(QString::fromStdString(Common::BuildDisplayName())));
         }
 #endif
 

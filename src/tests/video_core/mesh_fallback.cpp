@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
@@ -241,6 +244,60 @@ TEST_CASE("Mesh fallback vertex shader pulls the compute output",
     Dump(after_task, "fallback-vertex-after-task");
     REQUIRE(Model(after_task) == spv::ExecutionModel::Vertex);
     REQUIRE(Bindings(after_task) == std::vector<u32>{OUTPUT_BINDING, ARGS_BINDING});
+}
+
+namespace {
+bool HasBuiltIn(const std::vector<u32>& code, spv::BuiltIn builtin) {
+    return std::ranges::any_of(Instructions(code), [&](const Instruction& inst) {
+        return inst.op == spv::Op::OpDecorate &&
+               inst.operands[1] == static_cast<u32>(spv::Decoration::BuiltIn) &&
+               inst.operands[2] == static_cast<u32>(builtin);
+    });
+}
+} // Anonymous namespace
+
+TEST_CASE("Mesh fallback blocks hold one index per point and two per line",
+          "[video_core][spirv][mesh_fallback]") {
+    MeshInfo mesh{TriangleMesh()};
+    mesh.max_primitives = 8;
+    const u32 vertex_words{mesh.max_vertices * static_cast<u32>(mesh.vertex_lines.size())};
+    REQUIRE(SPIRV::MeshEmulationBlockWords(mesh) == vertex_words + 8 * 3);
+    mesh.topology = 1;
+    REQUIRE(SPIRV::MeshEmulationBlockWords(mesh) == vertex_words + 8 * 2);
+    mesh.topology = 0;
+    REQUIRE(SPIRV::MeshEmulationBlockWords(mesh) == vertex_words + 8);
+}
+
+TEST_CASE("Mesh fallback reserves storage for per-primitive attributes", "[video_core][spirv][mesh_fallback]") {
+    MeshInfo mesh{TriangleMesh()};
+    mesh.primitive_lines = {32, 36, 44, 45};
+    const u32 vertex_words{mesh.max_vertices * static_cast<u32>(mesh.vertex_lines.size())};
+    REQUIRE(SPIRV::MeshEmulationBlockWords(mesh) == vertex_words + mesh.max_primitives * 7);
+    const auto code = SPIRV::EmitMeshEmulationVertex(MakeProfile(), mesh, OUTPUT_BINDING, ~0U, false);
+    Dump(code, "fallback-vertex-per-primitive");
+    REQUIRE(Model(code) == spv::ExecutionModel::Vertex);
+}
+
+TEST_CASE("Mesh fallback vertex shader gives points a size and culls unused points and lines",
+          "[video_core][spirv][mesh_fallback]") {
+    MeshInfo mesh{TriangleMesh()};
+    REQUIRE_FALSE(HasBuiltIn(
+        SPIRV::EmitMeshEmulationVertex(MakeProfile(), mesh, OUTPUT_BINDING, ~0U, false),
+        spv::BuiltIn::PointSize));
+    mesh.topology = 1;
+    const std::vector<u32> lines{
+        SPIRV::EmitMeshEmulationVertex(MakeProfile(), mesh, OUTPUT_BINDING, ~0U, false)};
+    Dump(lines, "fallback-vertex-lines");
+    REQUIRE_FALSE(HasBuiltIn(lines, spv::BuiltIn::PointSize));
+    REQUIRE(HasBuiltIn(lines, spv::BuiltIn::ClipDistance));
+    mesh.topology = 0;
+    const std::vector<u32> points{
+        SPIRV::EmitMeshEmulationVertex(MakeProfile(), mesh, OUTPUT_BINDING, ARGS_BINDING, false,
+                                       2.0f)};
+    Dump(points, "fallback-vertex-points");
+    REQUIRE(Model(points) == spv::ExecutionModel::Vertex);
+    REQUIRE(HasBuiltIn(points, spv::BuiltIn::PointSize));
+    REQUIRE(HasBuiltIn(points, spv::BuiltIn::ClipDistance));
 }
 
 TEST_CASE("Mesh fallback distribution pass binds its buffers and constants",

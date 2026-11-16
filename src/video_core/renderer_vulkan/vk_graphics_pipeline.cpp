@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -5,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -871,9 +875,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     return ConfigureDraw(rescaling, render_area, is_indexed);
 }
 
+/// Writes the descriptors the stages queued and the push constants, then records the draw's state
+/// and bindings. Returns false, and the draw is skipped, when the queued descriptor count does not
+/// match the pipeline or no descriptor memory can be reserved.
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area,
                                      bool is_indexed) {
+    static const bool reuse_descriptors = [] {
+        const char* value = std::getenv("EDEN_NX2_DESCRIPTOR_REUSE");
+        const bool enabled = value == nullptr || value[0] != '0';
+        if (!enabled) {
+            LOG_INFO(Render_Vulkan, "Graphics descriptor payload reuse disabled for comparison");
+        }
+        return enabled;
+    }();
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
 
     VkDeviceSize descriptor_buffer_offset{};
@@ -881,6 +896,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (descriptor_set_layout && uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         const bool reuse_allocation =
+            reuse_descriptors &&
             last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
             last_descriptor_payload.size() == num_descriptor_entries &&
             std::memcmp(last_descriptor_payload.data(), entries,
@@ -1021,7 +1037,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 .payload_words = mesh_emulation->payload_stride,
                 .capacity_words = capacity,
                 .block_words = mesh_emulation->block_words,
-                .vertices_per_group = mesh_emulation->max_primitives * 3,
+                .vertices_per_group = MeshEmulationVerticesPerGroup(),
                 .max_groups = device.GetMaxComputeWorkGroupCount()[0],
             };
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_pipeline);
@@ -1097,7 +1113,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         update_descriptors =
-            bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
+            !reuse_descriptors || bind_pipeline ||
+            last_descriptor_payload.size() != num_descriptor_entries ||
             std::memcmp(last_descriptor_payload.data(), entries,
                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) != 0;
         if (update_descriptors) {
@@ -1176,6 +1193,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     return true;
 }
 
+/// Creates the Vulkan pipeline for `render_pass`. A mesh pipeline without VK_EXT_mesh_shader is
+/// built from the mesh emulation's vertex shader as a point, line or triangle list.
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (IsMeshPipeline() && !device.IsExtMeshShaderSupported() && !mesh_emulation) {
         return;
@@ -1524,9 +1543,10 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         };
         dynamic_states.insert(dynamic_states.end(), extended.begin(), extended.end());
 
-        // Buffer binding sets strides with vkCmdBindVertexBuffers2 even when vertex input
-        // is dynamic. Both states must be enabled; the last setter supplies the stride.
-        dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT);
+        // VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT
+        if (!key.state.dynamic_vertex_input) {
+            dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT);
+        }
     }
 
     // VK_DYNAMIC_STATE_VERTEX_INPUT_EXT
@@ -1644,7 +1664,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             .pSpecializationInfo = nullptr,
         });
     }
-    // Mesh emulation draws a plain triangle list without vertex attributes.
+    // Mesh emulation draws a plain point, line or triangle list without vertex attributes.
     const VkPipelineVertexInputStateCreateInfo emulation_vertex_input{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .pNext = nullptr,
@@ -1654,11 +1674,14 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .vertexAttributeDescriptionCount = 0,
         .pVertexAttributeDescriptions = nullptr,
     };
+    const u32 emulation_corners{mesh_emulation ? mesh_emulation->primitive_vertices : 3U};
     const VkPipelineInputAssemblyStateCreateInfo emulation_input_assembly{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .topology = emulation_corners == 1   ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                    : emulation_corners == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                                             : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         .primitiveRestartEnable = VK_FALSE,
     };
     VkPipelineCreateFlags flags{};

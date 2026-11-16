@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -326,6 +329,15 @@ enum class Counter : u32 {
     PendingWakePush,
     PendingWakeLatch,
     PendingWakeTimeout,
+    /// Of MethodWrites: constant buffer words (const_buffer.buffer .. +16), the uniform stream
+    CbWords,
+    /// Of MethodWrites: writes the front dropped as a same-value state write before any other work
+    DroppedSameFirst,
+    /// DrawIndexedIndirect calls the host GPU drew from their GPU-written records
+    /// (Maxwell3D::FrontTakeIndirectRecord)
+    IndirectRecords,
+    /// Of those, drawn after storage writes no barrier ordered yet (RasterizerVulkan::DrawIndirect)
+    IndirectRecordsUnordered,
     Count,
 };
 
@@ -509,6 +521,12 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(data.counters[static_cast<size_t>(Counter::DirectWrites)]) * 1e9 / window,
                             static_cast<double>(data.counters[static_cast<size_t>(Counter::MacroWrites)]) * 1e9 / window);
     }
+    if (data.counters[static_cast<size_t>(Counter::IndirectRecords)] != 0 ||
+        data.counters[static_cast<size_t>(Counter::IndirectRecordsUnordered)] != 0) {
+        line += fmt::format(" | indirect records {:.0f} ({:.0f} after unordered stores)",
+                            per_second(Counter::IndirectRecords),
+                            per_second(Counter::IndirectRecordsUnordered));
+    }
     if (data.counters[static_cast<size_t>(Counter::DrawBeginCoalesced)] != 0) {
         line += fmt::format(" | draw.begin coalesced {:.0f}",
                             per_second(Counter::DrawBeginCoalesced));
@@ -616,6 +634,17 @@ inline void Report(const char* thread_name = "GPU thread") {
         for (size_t i = 0; i < counter_names.size(); ++i) {
             snap.counters.emplace_back(counter_names[i],
                                        static_cast<double>(data.counters[i]) * per_s);
+        }
+        // Counters added after the first nine, named here so the array above keeps its order.
+        for (const auto& [name, counter] : {
+                 std::pair{"direct_writes", Counter::DirectWrites},
+                 std::pair{"macro_writes", Counter::MacroWrites},
+                 std::pair{"same_executable_writes", Counter::SameExecutableWrites},
+                 std::pair{"cb_words", Counter::CbWords},
+                 std::pair{"dropped_same_first", Counter::DroppedSameFirst},
+             }) {
+            snap.counters.emplace_back(
+                name, static_cast<double>(data.counters[static_cast<size_t>(counter)]) * per_s);
         }
         std::scoped_lock lock{SnapshotMutex()};
         Snapshots()[thread_name] = std::move(snap);

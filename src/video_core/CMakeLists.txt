@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -221,7 +224,6 @@ add_library(video_core STATIC
     renderer_vulkan/vk_present_manager.h
     renderer_vulkan/vk_query_cache.cpp
     renderer_vulkan/vk_query_cache.h
-    renderer_vulkan/vk_query_copy.h
     renderer_vulkan/vk_rasterizer.cpp
     renderer_vulkan/upload_batch.h
     renderer_vulkan/vk_rasterizer.h

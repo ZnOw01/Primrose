@@ -12,6 +12,14 @@ on:
       version:
         type: string
         required: true
+      display:
+        description: Human-facing build identity (plain variant)
+        type: string
+        default: ""
+      display_pgo:
+        description: Human-facing build identity (PGO variant)
+        type: string
+        default: ""
       refspec:
         type: string
         required: true
@@ -28,6 +36,10 @@ on:
         description: none or both
         type: string
         default: none
+      save_cache:
+        description: Force-save the compiler and CPM caches at the end of the job
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -57,6 +69,8 @@ jobs:
           refspec: ${{ inputs.refspec }}
           tag: ${{ inputs.tag }}
           release: ${{ inputs.release }}
+          save-cache: ${{ inputs.save_cache }}
+          display: ${{ inputs.display }}
 
       - name: Setup build from compatibility pin
         if: hashFiles('.github/actions/setup-build/action.yml') == ''
@@ -67,6 +81,7 @@ jobs:
           refspec: ${{ inputs.refspec }}
           tag: ${{ inputs.tag }}
           release: ${{ inputs.release }}
+          save-cache: ${{ inputs.save_cache }}
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -120,7 +135,7 @@ jobs:
           -DCMAKE_C_COMPILER_LAUNCHER=sccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
-      - name: CCache zero stats
+      - name: sccache zero stats
         shell: bash
         run: sccache --zero-stats
 
@@ -159,8 +174,6 @@ jobs:
     runs-on: windows-2025
     env:
       PLATFORM: windows-x86_64-pgo
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 1000M
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -177,6 +190,7 @@ jobs:
           refspec: ${{ inputs.refspec }}
           tag: ${{ inputs.tag }}
           release: ${{ inputs.release }}
+          save-cache: ${{ inputs.save_cache }}
 
       - name: Setup build from compatibility pin
         if: hashFiles('.github/actions/setup-build/action.yml') == ''
@@ -187,6 +201,8 @@ jobs:
           refspec: ${{ inputs.refspec }}
           tag: ${{ inputs.tag }}
           release: ${{ inputs.release }}
+          save-cache: ${{ inputs.save_cache }}
+          display: ${{ inputs.display_pgo }}
 
       # The profile is in the source tree, where the configure step reads it.
       - name: Check PGO profile
@@ -197,6 +213,11 @@ jobs:
 
       # Eden builds its Windows PGO binaries with MSYS2's clang toolchain, so we do the same. The
       # package list is docs/Deps.md (MSYS2) plus what the bundled FFmpeg needs to compile.
+      # `update: true` (a full `pacman -Syu`) is kept on purpose: skipping it installs from
+      # whatever package database the cached root carries, and on a cache miss that is the one
+      # bundled with the MSYS2 release. Tried it - the fresh root plus a stale DB produced a
+      # toolchain that could not compile a single test program ("Detecting C compiler ABI info -
+      # failed"), so the saved ~25 s is not worth a leg that dies once the cache is evicted.
       - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
         with:
@@ -246,9 +267,17 @@ jobs:
             "-DCMAKE_C_FLAGS=$profile" \
             "-DCMAKE_CXX_FLAGS=$profile"
 
+      - name: ccache settings
+        shell: msys2 {0}
+        run: |
+          ccache --version | head -1
+          ccache -p | grep -vE '^#' | grep -E '(cache_dir|compiler_check|base_dir|hash_dir|sloppiness|max_size|umask)' || true
+          pacman -Q ccache clang 2>/dev/null || true
+
       - name: Build
         shell: msys2 {0}
         run: |
+          ccache --zero-stats
           targets="yuzu yuzu-cmd"
           # The updater helper only exists in release and daily builds, where the update checker is on.
           if [ "${{ inputs.release || startsWith(inputs.tag, 'daily-') }}" = "true" ]; then targets="$targets eglantine-updater"; fi
@@ -257,7 +286,9 @@ jobs:
 
       # A dynamic MinGW build is not portable on its own: windeployqt6 brings the Qt libraries and
       # plugins, then every non-system DLL the binaries and those plugins pull in gets copied next to
-      # them (docs/Caveats.md#msys2).
+      # them (docs/Caveats.md#msys2). The GLib network information plugin is left out: it would bring
+      # GIO, which reads the registry's app and mail client registrations on load and gets the
+      # package flagged by malware sandboxes.
       - name: Package MinGW binary
         shell: msys2 {0}
         run: |
@@ -267,7 +298,7 @@ jobs:
           test -f eglantine.exe
           test -f eden-cli.exe
           windeployqt6 --no-translations --no-compiler-runtime --no-opengl-sw \
-            --no-system-dxc-compiler --no-system-d3d-compiler eglantine.exe
+            --no-system-dxc-compiler --no-system-d3d-compiler --exclude-plugins qglib eglantine.exe
           deps() {
             objdump -p "$1" | awk '/DLL Name:/ {print $3}' | while read -r dll; do
               [ -z "$dll" ] && continue

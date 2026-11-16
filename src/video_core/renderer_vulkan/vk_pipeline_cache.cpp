@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -2335,8 +2338,23 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
     }
     // Native draws can produce terrain data used only once. Submit them after compilation
     // instead of leaving permanent holes when their first use misses the shader cache.
+    // Depth-tested draws into a target first written in an earlier frame are skipped as for other
+    // titles: the title redraws that target every frame, so the draw is back once the pipeline is
+    // built. Waiting for those held Mario Kart World's frames 50-330 ms per new pipeline.
+    // EDEN_NX2_NATIVE_ASYNC=0 waits for every native draw again.
     if (maxwell3d->GetNativeMacroEngine().native_turing) {
-        return pipeline;
+        static const bool native_async = [] {
+            const char* value = std::getenv("EDEN_NX2_NATIVE_ASYNC");
+            return value == nullptr || value[0] != '0';
+        }();
+        const auto& regs = maxwell3d->regs;
+        // Depth test on (a bound depth buffer alone doesn't test) and a color target written:
+        // draws with every color write masked are depth-only and keep waiting.
+        if (!native_async || !regs.zeta_enable || !regs.depth_test_enable ||
+            ActiveColorTargetCount(regs) == 0 ||
+            !texture_cache.ColorTargetWrittenBeforeThisFrame()) {
+            return pipeline;
+        }
     }
     // If something is using depth, we can assume that games are not rendering anything which
     // will be used one time.
@@ -2662,9 +2680,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         bool eligible{mesh_index != 0 && (mesh_index == 1 || has_task) &&
                       layer_source_program == nullptr};
         const Shader::IR::Program& mesh{programs[mesh_index]};
-        eligible = eligible && mesh.mesh.topology == 4 && mesh.mesh.primitive_lines.empty() &&
+        // Points (0), lines (1) and triangles (4).
+        const u32 topology{mesh.mesh.topology};
+        eligible = eligible && (topology == 0 || topology == 1 || topology == 4) &&
+                   std::ranges::all_of(mesh.mesh.primitive_lines, [](u32 line) {
+                       return Shader::IR::IsGeneric(static_cast<Shader::IR::Attribute>(line));
+                   }) &&
                    !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
                    mesh.mesh.max_primitives != 0;
+        for (const u32 line : mesh.mesh.primitive_lines) {
+            eligible = eligible && std::ranges::find(mesh.mesh.vertex_lines, line) ==
+                                       mesh.mesh.vertex_lines.end();
+        }
         for (size_t index = 1; index < Maxwell::MaxShaderProgram && eligible; ++index) {
             const bool emulated{index == mesh_index || (has_task && index == 1)};
             eligible = emulated || key.unique_hashes[index] == 0 ||
@@ -2728,6 +2755,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         mesh_emulation->block_words = Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh.mesh);
         mesh_emulation->max_primitives = mesh.mesh.max_primitives;
+        mesh_emulation->primitive_vertices = mesh.mesh.PrimitiveVertices();
         mesh_emulation->max_vertices = mesh.mesh.max_vertices;
         mesh_emulation->vertex_lines = static_cast<u32>(mesh.mesh.vertex_lines.size());
         for (u32 line = 0; line < mesh.mesh.vertex_lines.size(); ++line) {

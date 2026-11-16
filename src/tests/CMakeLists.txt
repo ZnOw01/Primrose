@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -7,6 +10,7 @@
 add_executable(tests
     core/nx2_frame_interval.cpp
     video_core/upload_batch.cpp
+    video_core/texture_swizzle.cpp
     core/nx2_oot_time.cpp
     video_core/unbacked_image_policy.cpp
     core/builtin_patches.cpp
@@ -15,6 +19,9 @@ add_executable(tests
     video_core/gpu_timestamp.cpp
     video_core/maxwell_fast_method.cpp
     video_core/split_write_tracker.cpp
+    video_core/list_writer_trace.cpp
+    video_core/list_copy_demand.cpp
+    video_core/buffer_dependency_trace.cpp
     video_core/nx2_written_pages.cpp
     video_core/frame_dump_schedule.cpp
     core/nx2_debug_server.cpp
@@ -29,11 +36,13 @@ add_executable(tests
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
+    common/cpu_layout.cpp
     common/event.cpp
     common/fibers.cpp
     common/game_presets.cpp
     common/host_memory.cpp
     common/page_table.cpp
+    common/progress_counter.cpp
     common/param_package.cpp
     common/range_map.cpp
     common/range_set_subtract.cpp
@@ -47,6 +56,7 @@ add_executable(tests
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
     core/nup_writer.cpp
+    core/nup_zstd_read.cpp
     core/nx2_debug_server.cpp
     core/nx2_movie_pacing.cpp
     core/nx2_gpu_memory_registry.cpp
@@ -85,6 +95,12 @@ add_executable(tests
     video_core/ampere_guarded_ulea.cpp
     video_core/ampere_compute_lowering.cpp
     video_core/native_macro_fifo.cpp
+    video_core/native_image_matching.cpp
+    video_core/texture_cache_budget.cpp
+    video_core/usage_tracker.cpp
+    video_core/native_swizzle.cpp
+    video_core/image_allocation_pool.cpp
+    video_core/plain_unswizzle.cpp
     video_core/uniform_stream_reuse.cpp
     video_core/shader_invalidation.cpp
     video_core/descriptor_table.cpp

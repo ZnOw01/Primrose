@@ -1,4 +1,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eglantine Community
+
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-License-Identifier: GPL-3.0-or-later
 {
   description = "Eglantine";
@@ -16,7 +19,14 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
 
-      version = nixpkgs.lib.removeSuffix "\n" (builtins.readFile ./VERSION);
+      # The build identity CI hands the derivation (composed by tools/ci/prepare.sh
+      # and written by build-nix.yml). A checkout without one is a local build and
+      # keeps the release version from VERSION.
+      version = nixpkgs.lib.removeSuffix "\n" (
+        builtins.readFile (
+          if builtins.pathExists ./GIT-DISPLAY-STORE then ./GIT-DISPLAY-STORE else ./VERSION
+        )
+      );
 
       # The manifest readers and buildEdenEmulator for each system.
       emulatorTools = forAllSystems (

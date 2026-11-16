@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -17,8 +20,6 @@ const std::size_t EntriesPerHostPage = Common::HostPageSize / sizeof(Entry);
 } // namespace
 
 TEST_CASE("Page table block ids do not wrap", "[common]") {
-    using Entry = Common::PageTable::PageEntryData;
-
     REQUIRE(Entry::BlockIdForMapping(0) == 0);
     REQUIRE(Entry::BlockIdForMapping(65534) == 65534);
     REQUIRE(Entry::BlockIdForMapping(65535) == Entry::INVALID_BLOCK_ID);
@@ -28,8 +29,6 @@ TEST_CASE("Page table block ids do not wrap", "[common]") {
 }
 
 TEST_CASE("Page table fast spans reject exhausted block ids", "[common]") {
-    using Entry = Common::PageTable::PageEntryData;
-
     REQUIRE(Entry::CanFastSpan(7, 7));
     REQUIRE_FALSE(Entry::CanFastSpan(7, 8));
     REQUIRE_FALSE(Entry::CanFastSpan(Entry::INVALID_BLOCK_ID, Entry::INVALID_BLOCK_ID));

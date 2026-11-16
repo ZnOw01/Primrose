@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -126,7 +129,11 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     ui->buttonBox->setFocus();
 }
 
-ConfigureDialog::~ConfigureDialog() = default;
+ConfigureDialog::~ConfigureDialog() {
+    // Deleting the tab pages makes the tab widget switch tabs; don't run the handler on a
+    // half-destroyed dialog.
+    ui->tabWidget->blockSignals(true);
+}
 
 void ConfigureDialog::SetConfiguration() {}
 

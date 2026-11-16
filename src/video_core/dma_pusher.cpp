@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -143,6 +146,9 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
+        // The entry is the 5-word record of a DrawIndexedIndirect call the host GPU draws from
+        // guest memory (Maxwell3D::FrontTakeIndirectRecord): its words are not needed fresh.
+        bool skip_record_read = false;
         if (header.sync && g_nx2_ampere.load(std::memory_order_relaxed)) {
             VideoCommon::GpuSplit::Get().NoteSync();
         }
@@ -159,6 +165,13 @@ bool DmaPusher::Step() {
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
+                if (macro_payload && words == 5 && header.size == 5 &&
+                    dma_state.method_count == 5 && command_resume_offset == 0 &&
+                    VideoCommon::GpuSplit::Get().Active() &&
+                    static_cast<Engines::Maxwell3D*>(engine_state)
+                        ->FrontTakeIndirectRecord(dma_state.method, dma_state.dma_get)) {
+                    skip_record_read = true;
+                }
                 if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     const bool front_3d_macro =
                         macro_payload && split.FrontMacros() &&
@@ -218,12 +231,28 @@ bool DmaPusher::Step() {
         // written by a dispatch or copy still queued for it reads as unwritten, and its words as
         // stale (Fast Fusion's culling fills in instanced draws' arguments; stale ones asked for
         // billions of instances and lost the device loading a race).
-        bool gpu_written =
+        bool gpu_written = !skip_record_read &&
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+        // EDEN_NX2_ENTRY_WRITER_STATS=1 counts these waits and how many found newly GPU-written
+        // words; =2 also skips the wait (unsafe, measurement only).
+        static const int entry_writer_stats = [] {
+            const char* text = std::getenv("EDEN_NX2_ENTRY_WRITER_STATS");
+            return text != nullptr ? std::atoi(text) : 0;
+        }();
+        if (!skip_record_read && !gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+            entry_writer_stats != 2 &&
             VideoCommon::GpuSplit::Get().WaitForWriters()) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            if (entry_writer_stats != 0) {
+                static u64 waits{}, found{};
+                ++waits;
+                found += gpu_written ? 1 : 0;
+                if (waits % 20000 == 0) {
+                    LOG_INFO(HW_GPU, "nx2 entry writer waits: {} ({} found GPU-written words)",
+                             waits, found);
+                }
+            }
         }
         // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
         // safe read below would flush (with the split, the front can't tell: it reads memory
@@ -307,6 +336,12 @@ bool DmaPusher::Step() {
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+            const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+            RecordParsedEntry(header, commands);
+            command_resume_offset +=
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        } else if (skip_record_read) {
+            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             command_resume_offset +=

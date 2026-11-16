@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -104,7 +107,7 @@ struct ImageBase {
 
     ImageInfo info;
 
-    u32 guest_size_bytes = 0;
+    u64 guest_size_bytes = 0;
     u32 unswizzled_size_bytes = 0;
     u32 converted_size_bytes = 0;
     u32 scale_rating = 0;

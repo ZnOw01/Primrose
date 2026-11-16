@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -18,6 +21,16 @@ namespace Tegra {
     default:
         return 1;
     }
+}
+
+/// Switch 2 titles that keep the pre-nanosecond timestamps (GPU ticks divided by the clock setting,
+/// the non-ampere path below). Mario Kart World sizes its dynamic resolution from GPU timestamps:
+/// with nanoseconds the emulator's GPU latency reads as a nearly full frame budget, the resolution
+/// changes every few frames, and each change recreates and re-uploads its render targets (~20 fps
+/// instead of ~28-30 on an RX 6700S, 16x the texture cache image creations).
+[[nodiscard]] constexpr bool UsesLegacyAmpereTimestamps(u64 program_id) {
+    constexpr u64 MarioKartWorldProgramId = 0x0400C3F00006E000ULL;
+    return program_id == MarioKartWorldProgramId;
 }
 
 /// Switch 2 titles read report timestamps as nanoseconds and calibrate them against CPU time, so

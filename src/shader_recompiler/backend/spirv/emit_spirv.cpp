@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -495,12 +498,8 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);
         }
     }
-    // BaseInstance, BaseVertex and DrawIndex are DrawParameters built-ins no matter how the
-    // instance and vertex ids are read.
-    if (info.loads[IR::Attribute::BaseInstance] || info.loads[IR::Attribute::BaseVertex] ||
-        info.loads[IR::Attribute::DrawID] ||
-        (!profile.support_vertex_instance_id &&
-         (info.loads[IR::Attribute::InstanceId] || info.loads[IR::Attribute::VertexId]))) {
+    if (!profile.support_vertex_instance_id &&
+        (info.loads[IR::Attribute::InstanceId] || info.loads[IR::Attribute::VertexId])) {
         ctx.AddExtension("SPV_KHR_shader_draw_parameters");
         ctx.AddCapability(spv::Capability::DrawParameters);
     }

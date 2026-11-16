@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -198,6 +201,8 @@ private:
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();
+    /// EDEN_NX2_WRITER_DEPS (diagnostic): what a command-list-writing dispatch samples.
+    void NoteWriterDeps(const ComputePipeline& pipeline);
     /// The split back's idle hook: submits pending list copies and deferred work.
     void FlushSplitIdle();
 
@@ -367,6 +372,7 @@ private:
         u32 vertex_lines{};
         u32 max_vertices{};
         u32 max_primitives{};
+        u32 primitive_vertices{3};
         std::array<u32, 4> position_lines{};
         bool pending{};
     } mesh_probe;

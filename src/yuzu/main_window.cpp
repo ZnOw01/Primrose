@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -412,24 +415,6 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     filter.ParseFilterString(Settings::values.log_filter.GetValue());
     Common::Log::SetGlobalFilter(filter);
 
-    if (user_data_migrator.migrated) {
-        // Sort-of hack whereby we only move the old dir if it's a subfolder of the user dir
-
-        using namespace Common::FS;
-
-        static constexpr const std::array<const EdenPath, 4> paths = {
-            EdenPath::NANDDir, EdenPath::SDMCDir, EdenPath::DumpDir, EdenPath::LoadDir};
-
-        for (const EdenPath& path : paths) {
-            std::string str_path = Common::FS::GetEdenPathString(path);
-            if (str_path.starts_with(user_data_migrator.selected_emu.get_user_dir())) {
-                boost::replace_all(
-                    str_path, user_data_migrator.selected_emu.lower_name().toStdString(), "eden");
-                Common::FS::SetEdenPath(path, str_path);
-            }
-        }
-    }
-
 #ifdef __unix__
     SetupSigInterrupts();
 #endif
@@ -439,6 +424,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     UISettings::RestoreWindowState(config);
 
     LoadTranslation();
+    UserDataMigrator::ReconcileLegacyPaths(this, *config);
     FrontendCommon::GenerateSettings();
 
     setAcceptDrops(true);
@@ -4127,6 +4113,9 @@ void MainWindow::OpenConfigureDialog(bool select_profiles) {
     const bool old_discord_presence = UISettings::values.enable_discord_presence.GetValue();
     const auto old_language_index = Settings::values.language_index.GetValue();
     const bool old_gamemode = UISettings::values.enable_gamemode.GetValue();
+#ifdef ENABLE_UPDATE_CHECKER
+    const auto old_update_channel = UISettings::values.update_channel.GetValue();
+#endif
 #ifdef __unix__
     const bool old_force_x11 = UISettings::values.gui_force_x11.GetValue();
 #endif
@@ -4227,6 +4216,16 @@ void MainWindow::OpenConfigureDialog(bool select_profiles) {
     UISettings::values.configuration_applied = false;
 
     config->SaveAllValues();
+
+#ifdef ENABLE_UPDATE_CHECKER
+    // Checked right away, as a switch between daily builds and tagged releases is only offered when
+    // asked for.
+    const auto update_channel = UISettings::values.update_channel.GetValue();
+    if (update_channel != old_update_channel && update_channel != Settings::UpdateChannel::Unset &&
+        UpdateChecker::BuildChannel()) {
+        CheckForUpdates(true);
+    }
+#endif
 
     if ((UISettings::values.hide_mouse || Settings::values.mouse_panning) && emulation_running) {
         render_window->installEventFilter(render_window);
@@ -5153,6 +5152,14 @@ void MainWindow::OnCaptureScreenshot() {
 }
 
 #ifdef ENABLE_UPDATE_CHECKER
+// A daily build is rebuilt under the same tag, so skipping one names its commit too.
+static std::string SkippedUpdateKey(const Common::Net::Release& release) {
+    if (release.commit.empty() || !UpdateChecker::ParseDailyTag(release.tag)) {
+        return release.tag;
+    }
+    return release.tag + "@" + release.commit;
+}
+
 void MainWindow::CheckForUpdates(bool manual) {
     if (update_check_running) {
         // Report the check that is already in flight instead of starting another one
@@ -5235,19 +5242,26 @@ void MainWindow::OnEmulatorUpdateAvailable() {
                 this, title,
                 tr("You are running the newest version on the %1 channel (%2).")
                     .arg(UpdateDialog::ChannelName(channel),
-                         QString::fromUtf8(Common::g_build_version)));
+                         QString::fromStdString(Common::BuildDisplayName())));
         }
         return;
     }
 
     const auto& release = *result.update;
-    if (!manual && UISettings::values.skipped_update.GetValue() == release.tag) {
-        return;
+    if (!manual) {
+        if (UISettings::values.skipped_update.GetValue() == SkippedUpdateKey(release)) {
+            return;
+        }
+        // Daily builds and tagged releases cannot be ordered, so a switch is as likely a downgrade
+        // and is not offered at every startup.
+        if (UpdateChecker::IsChannelSwitch(UpdateChecker::BuildTag(), release.tag)) {
+            return;
+        }
     }
 
     UpdateDialog dialog(release, channel, this);
     if (dialog.exec() == UpdateDialog::SkipVersion) {
-        UISettings::values.skipped_update.SetValue(release.tag);
+        UISettings::values.skipped_update.SetValue(SkippedUpdateKey(release));
         config->SaveAllValues();
     }
 }
@@ -5291,9 +5305,7 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
 void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
                                    std::string_view gpu_vendor) {
     static const std::string build_id = std::string{Common::g_build_id};
-    static const std::string yuzu_title =
-        fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
+    static const std::string yuzu_title = Common::BuildDisplayName();
 
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);

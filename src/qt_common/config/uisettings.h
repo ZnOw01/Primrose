@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -241,6 +244,7 @@ struct Values {
 
     // misc
     Setting<bool> show_fw_warning{linkage, true, "show_fw_warning", Category::Miscellaneous};
+    Setting<bool> check_legacy_paths{linkage, true, "check_legacy_paths", Category::UiGeneral};
 
     bool configuration_applied;
     bool reset_to_defaults;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -229,13 +232,11 @@ void Init(QWidget* root) {
 
     QtCommon::Meta::RegisterMetaTypes();
 
-    // build version
-    const auto branch_name = std::string(Common::g_scm_branch);
-    const auto description = std::string(Common::g_scm_desc);
+    // build version: what CI composed for this build (branch, commit date, sha,
+    // PGO), not the raw sha-prefixed string it used to be
     const auto build_id = std::string(Common::g_build_id);
 
-    const auto yuzu_build =
-        fmt::format("Eglantine Development Build | {}-{}", branch_name, description);
+    const auto yuzu_build = Common::BuildDisplayName();
     const auto override_build =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
     const auto yuzu_build_version = override_build.empty() ? yuzu_build : override_build;
