@@ -277,6 +277,7 @@ jobs:
     uses: ./.github/workflows/release.yml
     secrets:
       DISCORD_WEBHOOK_URL: ${{ github.event_name != 'pull_request' && secrets.DISCORD_WEBHOOK_URL || '' }}
+      DISCORD_FORUM_WEBHOOK_URL: ${{ github.event_name != 'pull_request' && secrets.DISCORD_FORUM_WEBHOOK_URL || '' }}
     with:
       kind: ${{ needs.prepare.outputs.kind }}
       tag: ${{ needs.prepare.outputs.tag }}

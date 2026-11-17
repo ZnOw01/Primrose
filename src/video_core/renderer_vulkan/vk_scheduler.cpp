@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -166,6 +167,9 @@ void Scheduler::DispatchWork() {
         // The worker must receive everything recorded so far.
         FlushUploads();
     }
+    if (pass_held) {
+        ReleasePass();
+    }
     if (chunk && !chunk->Empty()) {
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
         // draws): skip it while the worker is still busy, it pops the queue before waiting.
@@ -225,6 +229,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
         values[i] = clear_values[i];
     }
     const bool after_compute = std::exchange(compute_writes_pending, false);
+    // A pass that begins with a clear writes its attachments before any draw.
+    render_pass_depth_written = clear_value_count != 0;
+    HoldPass();
     Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
             after_compute](vk::CommandBuffer cmdbuf) {
         const VkRenderPassBeginInfo renderpass_bi{
@@ -532,6 +539,7 @@ void Scheduler::EndRenderPass()
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;
+        render_pass_depth_written = false;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 
@@ -601,21 +609,177 @@ void Scheduler::EndRenderPass()
             }
         });
 
+        if (const VkPipelineStageFlags stages = std::exchange(deferred_wfi_stages, 0)) {
+            // The guest's wait-for-idle (RasterizerVulkan::WaitForIdle) from inside the pass.
+            Record([stages](vk::CommandBuffer cmdbuf) {
+                static constexpr VkMemoryBarrier WFI_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(stages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
+            });
+            storage_writes_unordered = false;
+        }
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
+        ++pass_epoch;
+        if (pass_held) {
+            ReleasePass();
+        }
     }
 
 
 void Scheduler::AcquireNewChunk() {
+    chunk = TakeReserveChunk();
+}
+
+std::unique_ptr<Scheduler::CommandChunk> Scheduler::TakeReserveChunk() {
     std::scoped_lock rl{reserve_mutex};
 
     if (chunk_reserve.empty()) {
         // If we don't have anything reserved, we need to make a new chunk.
-        chunk = std::make_unique<CommandChunk>();
-    } else {
-        // Otherwise, we can just take from the reserve.
-        chunk = std::move(chunk_reserve.back());
-        chunk_reserve.pop_back();
+        return std::make_unique<CommandChunk>();
+    }
+    // Otherwise, we can just take from the reserve.
+    std::unique_ptr<CommandChunk> reserved = std::move(chunk_reserve.back());
+    chunk_reserve.pop_back();
+    return reserved;
+}
+
+namespace {
+bool PassHoldEnabled() {
+    // EDEN_NX2_MESH_HOIST=0: end the render pass at every emulated mesh draw, as before.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MESH_HOIST");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // namespace
+
+void Scheduler::HoldPass() {
+    // Only without VK_EXT_mesh_shader: mesh draws are emulated with compute dispatches then.
+    if (!PassHoldEnabled() || device.IsExtMeshShaderSupported()) {
+        return;
+    }
+    if (pass_held) {
+        ReleasePass();
+    }
+    if (!chunk->Empty()) {
+        before_pass_chunks.push_back(std::move(chunk));
+        AcquireNewChunk();
+    }
+    pass_held = true;
+}
+
+bool Scheduler::HoldFullPassChunk() {
+    // About 256 KiB of commands: past that the worker would sit idle too long behind the pass.
+    static constexpr size_t MaxHeldPassChunks = 8;
+    if (pass_chunks.size() >= MaxHeldPassChunks) {
+        ReleasePass();
+        return false;
+    }
+    pass_chunks.push_back(std::move(chunk));
+    AcquireNewChunk();
+    return true;
+}
+
+void Scheduler::ReleasePass() {
+    pass_held = false;
+    if (!chunk->Empty()) {
+        pass_chunks.push_back(std::move(chunk));
+    }
+    // The barriers around and between the stages of the work recorded before the pass.
+    const auto barrier_chunk = [this](VkAccessFlags src_access, VkAccessFlags dst_access,
+                                      VkPipelineStageFlags src_stages,
+                                      VkPipelineStageFlags dst_stages) {
+        std::unique_ptr<CommandChunk> barrier = TakeReserveChunk();
+        auto command = [src_access, dst_access, src_stages, dst_stages](vk::CommandBuffer cmdbuf,
+                                                                        vk::CommandBuffer) {
+            const VkMemoryBarrier memory_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = src_access,
+                .dstAccessMask = dst_access,
+            };
+            cmdbuf.PipelineBarrier(src_stages, dst_stages, 0, memory_barrier);
+        };
+        (void)barrier->Record(command);
+        return barrier;
+    };
+    std::vector<std::unique_ptr<CommandChunk>> pre_pass;
+    bool any_stage = false;
+    bool any_compute = false;
+    constexpr size_t upload_stage = static_cast<size_t>(PrePassStage::Upload);
+    if (!pre_pass_chunks[upload_stage].empty()) {
+        // Uploads: after what earlier passes, dispatches and copies read and wrote.
+        pre_pass.push_back(barrier_chunk(
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT));
+        for (auto& held : pre_pass_chunks[upload_stage]) {
+            pre_pass.push_back(std::move(held));
+        }
+        pre_pass_chunks[upload_stage].clear();
+        any_stage = true;
+    }
+    for (size_t stage = upload_stage + 1; stage < pre_pass_chunks.size(); ++stage) {
+        auto& chunks = pre_pass_chunks[stage];
+        if (chunks.empty()) {
+            continue;
+        }
+        if (!any_compute) {
+            // The programs read what earlier passes, dispatches and copies wrote (foliage
+            // instance lists, for one).
+            pre_pass.push_back(barrier_chunk(
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT));
+        } else {
+            // The distribution reads the task output and writes the mesh dispatch and draw
+            // arguments (and the arena counter the host reads after the submission).
+            pre_pass.push_back(barrier_chunk(
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
+                    VK_ACCESS_HOST_READ_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                    VK_PIPELINE_STAGE_HOST_BIT));
+        }
+        any_stage = true;
+        any_compute = true;
+        for (auto& held : chunks) {
+            pre_pass.push_back(std::move(held));
+        }
+        chunks.clear();
+    }
+    if (any_stage) {
+        // The pass's draws read the mesh output in their vertex shaders and their vertex counts
+        // as indirect arguments, and the uploads as vertices, indices, uniforms and storage in
+        // any stage.
+        pre_pass.push_back(barrier_chunk(
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            vk::PIPELINE_STAGE_GRAPHICS_COMPUTE));
+    }
+    bool wake;
+    {
+        std::scoped_lock ql{queue_mutex};
+        for (auto* list : {&before_pass_chunks, &pre_pass, &pass_chunks}) {
+            for (auto& held : *list) {
+                work_queue.push(std::move(held));
+            }
+            list->clear();
+        }
+        wake = worker_waiting;
+    }
+    if (wake) {
+        event_cv.notify_all();
+    }
+    if (!chunk) {
+        AcquireNewChunk();
     }
 }
 

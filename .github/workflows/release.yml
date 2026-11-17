@@ -33,6 +33,8 @@ on:
     secrets:
       DISCORD_WEBHOOK_URL:
         required: false
+      DISCORD_FORUM_WEBHOOK_URL:
+        required: false
 
 permissions:
   contents: write
@@ -172,6 +174,59 @@ jobs:
               gh release delete "$old" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
             done
 
+      # Each daily build gets its own forum post so discussion stays in one place. The webhook
+      # belongs to the forum channel: executing it with thread_name creates a post and, with
+      # wait=true, returns the message whose channel_id is the new thread id. The webhook's own
+      # metadata supplies the guild id needed to build a link to that post.
+      - name: Post daily build to Discord forum
+        id: forum
+        if: >-
+          inputs.kind == 'daily' &&
+          github.repository == 'Eglantine-Community/Eglantine'
+        shell: bash
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_FORUM_WEBHOOK_URL }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WEBHOOK" ]; then
+            echo "No DISCORD_FORUM_WEBHOOK_URL secret, skipping forum post."
+            exit 0
+          fi
+          # Webhook URLs are .../api/webhooks/<id>/<token>; rebuild the API URL from them.
+          token=${WEBHOOK##*/}
+          hook_id=${WEBHOOK%/*}
+          hook_id=${hook_id##*/}
+          api="https://discord.com/api/webhooks/$hook_id/$token"
+
+          if ! guild_id=$(curl -fsS "$api" | jq -r '.guild_id // empty'); then
+            echo "::warning::Could not read the forum webhook's guild id; skipping forum post."
+            exit 0
+          fi
+          if [ -z "$guild_id" ]; then
+            echo "::warning::Forum webhook has no guild id; skipping forum post."
+            exit 0
+          fi
+
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          thread_name="${TITLE} (${SHA::7})"
+          content=$(printf 'Automatic daily build of `%s` at `%s`.\n\nFull notes and downloads: %s' \
+            "$BRANCH" "${SHA::7}" "$release_url")
+          # thread_name creates the post; the returned message's channel_id is the post's thread id.
+          if ! jq -n --arg content "$content" --arg thread_name "$thread_name" \
+              '{content: $content, thread_name: $thread_name, allowed_mentions: {parse: []}}' \
+              | curl -fsS -H 'Content-Type: application/json' -d @- "$api?wait=true" > forum-message.json; then
+            echo "::warning::Could not create the Discord forum post; the channel ping will link to the release."
+            exit 0
+          fi
+          thread_id=$(jq -r '.channel_id // empty' forum-message.json)
+          message_id=$(jq -r '.id // empty' forum-message.json)
+          if [ -z "$thread_id" ] || [ -z "$message_id" ]; then
+            echo "::warning::Discord did not return the new post's ids; the channel ping will link to the release."
+            exit 0
+          fi
+          echo "post_url=https://discord.com/channels/${guild_id}/${thread_id}/${message_id}" >> "$GITHUB_OUTPUT"
+
       - name: Ping Discord
         if: >-
           (inputs.kind == 'stable' || inputs.kind == 'rc' || inputs.kind == 'daily') &&
@@ -179,10 +234,17 @@ jobs:
         shell: bash
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          POST_URL: ${{ steps.forum.outputs.post_url }}
         run: |
           set -euo pipefail
           if [ -z "$WEBHOOK" ]; then echo "No DISCORD_WEBHOOK_URL secret, skipping."; exit 0; fi
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          # Daily builds point at their forum post when one was created; stable/RC builds, and
+          # dailies without a forum webhook, keep pointing at the GitHub release.
+          if [ -n "$POST_URL" ]; then
+            URL="$POST_URL"
+          else
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          fi
           MSG=$(printf '## <@&1566184315178713190> %s (%s)\n%s' "$TITLE" "${SHA::7}" "$URL")
           jq -n --arg content "$MSG" \
             '{content: $content, allowed_mentions: {roles: ["1566184315178713190"]}}' |

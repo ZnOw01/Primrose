@@ -927,35 +927,29 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         }
     }
 
+    // The set the emulation's dispatch commits and its draw binds. Per draw: the dispatches of
+    // a render pass's emulated draws can all run before the pass (RecordBeforeRenderPass).
+    std::shared_ptr<VkDescriptorSet> mesh_set_slot;
     if (mesh_emulation) {
+        mesh_set_slot = std::make_shared<VkDescriptorSet>(VkDescriptorSet{VK_NULL_HANDLE});
         // The mesh program runs as a compute dispatch outside the render pass and writes the
-        // triangles the draw then reads; both use the descriptor set committed here.
-        scheduler.RequestOutsideRenderPassOperationContext();
-        if (!IsBuilt()) {
-            scheduler.Record([this](vk::CommandBuffer) {
-                RunBuild();
-                std::unique_lock lock{build_mutex};
-                build_condvar.wait(lock,
-                                   [this] { return is_built.load(std::memory_order::relaxed); });
-            });
+        // triangles the draw then reads; both use the descriptor set committed here. When the
+        // draw's render pass is already active, the dispatch runs before that pass instead of
+        // ending it (unless the pass wrote storage the dispatch could read).
+        const bool before_pass{
+            scheduler.CanRecordBeforeRenderPass(texture_cache.GetFramebuffer()->Handle())};
+        if (!before_pass) {
+            scheduler.RequestOutsideRenderPassOperationContext();
         }
-        scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
-                          task_buffers = mesh_task_buffers,
-                          rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
-                          uses_render_area = render_area.uses_render_area,
-                          render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
-            mesh_descriptor_set = VK_NULL_HANDLE;
+        if (before_pass) {
+            // Before the pass: the same programs, one command per stage, without barriers of
+            // their own (the scheduler puts one between stages for all the pass's draws).
             const bool has_task{mesh_emulation->has_task};
-            if (!pipeline || !mesh_compute_pipeline || groups == 0 ||
-                (has_task && (!task_compute_pipeline || !distribution_pipeline))) {
-                return;
-            }
-            const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
-            device.GetLogical().UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
-                                                    descriptor_data);
-            mesh_descriptor_set = descriptor_set;
-            // The task and mesh programs read the draw's push constants and descriptors.
-            const auto bind_program_state = [&] {
+            const auto program_state = [this, rescaling_data = rescaling.Data(),
+                                        is_rescaling = texture_cache.IsRescaling(),
+                                        uses_render_area = render_area.uses_render_area,
+                                        render_area_data = render_area.words](
+                                           vk::CommandBuffer cmdbuf, VkDescriptorSet set) {
                 constexpr VkShaderStageFlags push_stages{VK_SHADER_STAGE_ALL_GRAPHICS |
                                                          VK_SHADER_STAGE_COMPUTE_BIT};
                 cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
@@ -969,102 +963,241 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                     cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
                                          sizeof(render_area_data), &render_area_data);
                 }
-                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
-                                          descriptor_set, nullptr);
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, set,
+                                          nullptr);
             };
-            const auto memory_barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access,
-                                            VkPipelineStageFlags src_stages,
-                                            VkPipelineStageFlags dst_stages) {
-                const VkMemoryBarrier barrier{
-                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                    .pNext = nullptr,
-                    .srcAccessMask = src_access,
-                    .dstAccessMask = dst_access,
-                };
-                cmdbuf.PipelineBarrier(src_stages, dst_stages, 0, barrier);
+            // The first stage commits the draw's set; the later ones skip when it did not.
+            const auto commit_set = [this, descriptor_data, groups = mesh_groups,
+                                     set_slot = mesh_set_slot, has_task]() -> VkDescriptorSet {
+                if (!pipeline || !mesh_compute_pipeline || groups == 0 ||
+                    (has_task && (!task_compute_pipeline || !distribution_pipeline))) {
+                    return VK_NULL_HANDLE;
+                }
+                const VkDescriptorSet set{descriptor_allocator.Commit()};
+                device.GetLogical().UpdateDescriptorSet(set, *descriptor_update_template,
+                                                        descriptor_data);
+                *set_slot = set;
+                return set;
             };
-            // The scheduler orders earlier compute writes only before the next render pass
-            // (COMPUTE -> ALL_GRAPHICS); these dispatches run before it, and the programs read
-            // what the game's compute passes wrote (foliage instance lists, for one).
-            memory_barrier(VK_ACCESS_MEMORY_WRITE_BIT,
-                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-                           vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             if (!has_task) {
-                cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
+                scheduler.RecordBeforeRenderPass(
+                    Scheduler::PrePassStage::Mesh,
+                    [this, commit_set, program_state, groups = mesh_groups](vk::CommandBuffer cmdbuf) {
+                        const VkDescriptorSet set{commit_set()};
+                        if (!set) {
+                            return;
+                        }
+                        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
+                        program_state(cmdbuf, set);
+                        cmdbuf.Dispatch(groups, 1, 1);
+                    });
+            } else {
+                // 1. One task workgroup per draw group writes its payload.
+                scheduler.RecordBeforeRenderPass(
+                    Scheduler::PrePassStage::Task,
+                    [this, commit_set, program_state, groups = mesh_groups](vk::CommandBuffer cmdbuf) {
+                        const VkDescriptorSet set{commit_set()};
+                        if (!set) {
+                            return;
+                        }
+                        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *task_compute_pipeline);
+                        program_state(cmdbuf, set);
+                        cmdbuf.Dispatch(groups, 1, 1);
+                    });
+                // 2. Distribution: the mesh dispatch and draw arguments.
+                scheduler.RecordBeforeRenderPass(
+                    Scheduler::PrePassStage::Distribution,
+                    [this, groups = mesh_groups, capacity = mesh_capacity,
+                     task_buffers = mesh_task_buffers, set_slot = mesh_set_slot](
+                        vk::CommandBuffer cmdbuf) {
+                        if (!*set_slot) {
+                            return;
+                        }
+                        const VkDescriptorSet distribution_set{distribution_allocator.Commit()};
+                        std::array<VkDescriptorBufferInfo, 4> buffer_infos{};
+                        std::array<VkWriteDescriptorSet, 4> writes{};
+                        for (u32 binding = 0; binding < 4; ++binding) {
+                            buffer_infos[binding] = {
+                                .buffer = task_buffers[binding].buffer,
+                                .offset = task_buffers[binding].offset,
+                                .range = task_buffers[binding].size,
+                            };
+                            writes[binding] = {
+                                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                .pNext = nullptr,
+                                .dstSet = distribution_set,
+                                .dstBinding = binding,
+                                .dstArrayElement = 0,
+                                .descriptorCount = 1,
+                                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                .pImageInfo = nullptr,
+                                .pBufferInfo = &buffer_infos[binding],
+                                .pTexelBufferView = nullptr,
+                            };
+                        }
+                        device.GetLogical().UpdateDescriptorSets(writes, {});
+                        const Shader::Backend::SPIRV::MeshEmulationDistributionConstants constants{
+                            .tasks = groups,
+                            .payload_words = mesh_emulation->payload_stride,
+                            .capacity_words = capacity,
+                            .block_words = mesh_emulation->block_words,
+                            .vertices_per_group = MeshEmulationVerticesPerGroup(),
+                            .max_groups = device.GetMaxComputeWorkGroupCount()[0],
+                        };
+                        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_pipeline);
+                        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                  *distribution_layout, 0, distribution_set,
+                                                  nullptr);
+                        cmdbuf.PushConstants(*distribution_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(constants), &constants);
+                        cmdbuf.Dispatch(1, 1, 1);
+                    });
+                // 3. The mesh workgroups the tasks asked for.
+                scheduler.RecordBeforeRenderPass(
+                    Scheduler::PrePassStage::Mesh,
+                    [this, program_state, task_buffers = mesh_task_buffers,
+                     set_slot = mesh_set_slot](vk::CommandBuffer cmdbuf) {
+                        if (!*set_slot) {
+                            return;
+                        }
+                        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
+                        program_state(cmdbuf, *set_slot);
+                        cmdbuf.DispatchIndirect(task_buffers[2].buffer, task_buffers[2].offset);
+                    });
+            }
+        } else {
+            scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
+                              task_buffers = mesh_task_buffers, set_slot = mesh_set_slot,
+                              rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
+                              uses_render_area = render_area.uses_render_area,
+                              render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+                const bool has_task{mesh_emulation->has_task};
+                if (!pipeline || !mesh_compute_pipeline || groups == 0 ||
+                    (has_task && (!task_compute_pipeline || !distribution_pipeline))) {
+                    return;
+                }
+                const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
+                device.GetLogical().UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
+                                                        descriptor_data);
+                *set_slot = descriptor_set;
+                // The task and mesh programs read the draw's push constants and descriptors.
+                const auto bind_program_state = [&] {
+                    constexpr VkShaderStageFlags push_stages{VK_SHADER_STAGE_ALL_GRAPHICS |
+                                                             VK_SHADER_STAGE_COMPUTE_BIT};
+                    cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                                         sizeof(rescaling_data), rescaling_data.data());
+                    const f32 config_down_factor{Settings::values.resolution_info.down_factor};
+                    const f32 down_factor{is_rescaling ? config_down_factor : 1.0f};
+                    cmdbuf.PushConstants(*pipeline_layout, push_stages,
+                                         RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(down_factor),
+                                         &down_factor);
+                    if (uses_render_area) {
+                        cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
+                                             sizeof(render_area_data), &render_area_data);
+                    }
+                    cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
+                                              descriptor_set, nullptr);
+                };
+                const auto memory_barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access,
+                                                VkPipelineStageFlags src_stages,
+                                                VkPipelineStageFlags dst_stages) {
+                    const VkMemoryBarrier barrier{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = src_access,
+                        .dstAccessMask = dst_access,
+                    };
+                    cmdbuf.PipelineBarrier(src_stages, dst_stages, 0, barrier);
+                };
+                // The scheduler orders earlier compute writes only before the next render pass
+                // (COMPUTE -> ALL_GRAPHICS); these dispatches run before it, and the programs read
+                // what the game's compute passes wrote (foliage instance lists, for one).
+                memory_barrier(VK_ACCESS_MEMORY_WRITE_BIT,
+                               VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                if (!has_task) {
+                    cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
+                    bind_program_state();
+                    cmdbuf.Dispatch(groups, 1, 1);
+                    memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
+                    return;
+                }
+                // 1. One task workgroup per draw group writes its payload (mesh workgroup count at
+                //    word 1).
+                cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *task_compute_pipeline);
                 bind_program_state();
                 cmdbuf.Dispatch(groups, 1, 1);
                 memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                // 2. Distribution: each task's first mesh workgroup, the draw's place in the output
+                //    arena, and the mesh dispatch and draw arguments.
+                const VkDescriptorSet distribution_set{distribution_allocator.Commit()};
+                std::array<VkDescriptorBufferInfo, 4> buffer_infos{};
+                std::array<VkWriteDescriptorSet, 4> writes{};
+                for (u32 binding = 0; binding < 4; ++binding) {
+                    buffer_infos[binding] = {
+                        .buffer = task_buffers[binding].buffer,
+                        .offset = task_buffers[binding].offset,
+                        .range = task_buffers[binding].size,
+                    };
+                    writes[binding] = {
+                        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                        .pNext = nullptr,
+                        .dstSet = distribution_set,
+                        .dstBinding = binding,
+                        .dstArrayElement = 0,
+                        .descriptorCount = 1,
+                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        .pImageInfo = nullptr,
+                        .pBufferInfo = &buffer_infos[binding],
+                        .pTexelBufferView = nullptr,
+                    };
+                }
+                device.GetLogical().UpdateDescriptorSets(writes, {});
+                const Shader::Backend::SPIRV::MeshEmulationDistributionConstants constants{
+                    .tasks = groups,
+                    .payload_words = mesh_emulation->payload_stride,
+                    .capacity_words = capacity,
+                    .block_words = mesh_emulation->block_words,
+                    .vertices_per_group = MeshEmulationVerticesPerGroup(),
+                    .max_groups = device.GetMaxComputeWorkGroupCount()[0],
+                };
+                cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_pipeline);
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_layout, 0,
+                                          distribution_set, nullptr);
+                cmdbuf.PushConstants(*distribution_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                     sizeof(constants), &constants);
+                cmdbuf.Dispatch(1, 1, 1);
+                // The host reads the arena counter once the submission finishes.
+                memory_barrier(VK_ACCESS_SHADER_WRITE_BIT,
+                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
+                                   VK_ACCESS_HOST_READ_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_HOST_BIT);
+                // 3. The mesh workgroups, as many as the tasks asked for (up to the arena's end).
+                cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
+                bind_program_state();
+                cmdbuf.DispatchIndirect(task_buffers[2].buffer, task_buffers[2].offset);
+                memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
-                return;
-            }
-            // 1. One task workgroup per draw group writes its payload (mesh workgroup count at
-            //    word 1).
-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *task_compute_pipeline);
-            bind_program_state();
-            cmdbuf.Dispatch(groups, 1, 1);
-            memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            // 2. Distribution: each task's first mesh workgroup, the draw's place in the output
-            //    arena, and the mesh dispatch and draw arguments.
-            const VkDescriptorSet distribution_set{distribution_allocator.Commit()};
-            std::array<VkDescriptorBufferInfo, 4> buffer_infos{};
-            std::array<VkWriteDescriptorSet, 4> writes{};
-            for (u32 binding = 0; binding < 4; ++binding) {
-                buffer_infos[binding] = {
-                    .buffer = task_buffers[binding].buffer,
-                    .offset = task_buffers[binding].offset,
-                    .range = task_buffers[binding].size,
-                };
-                writes[binding] = {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .pNext = nullptr,
-                    .dstSet = distribution_set,
-                    .dstBinding = binding,
-                    .dstArrayElement = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pImageInfo = nullptr,
-                    .pBufferInfo = &buffer_infos[binding],
-                    .pTexelBufferView = nullptr,
-                };
-            }
-            device.GetLogical().UpdateDescriptorSets(writes, {});
-            const Shader::Backend::SPIRV::MeshEmulationDistributionConstants constants{
-                .tasks = groups,
-                .payload_words = mesh_emulation->payload_stride,
-                .capacity_words = capacity,
-                .block_words = mesh_emulation->block_words,
-                .vertices_per_group = MeshEmulationVerticesPerGroup(),
-                .max_groups = device.GetMaxComputeWorkGroupCount()[0],
-            };
-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_pipeline);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *distribution_layout, 0,
-                                      distribution_set, nullptr);
-            cmdbuf.PushConstants(*distribution_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                 sizeof(constants), &constants);
-            cmdbuf.Dispatch(1, 1, 1);
-            // The host reads the arena counter once the submission finishes.
-            memory_barrier(VK_ACCESS_SHADER_WRITE_BIT,
-                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT |
-                               VK_ACCESS_HOST_READ_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                               VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_HOST_BIT);
-            // 3. The mesh workgroups, as many as the tasks asked for (up to the arena's end).
-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
-            bind_program_state();
-            cmdbuf.DispatchIndirect(task_buffers[2].buffer, task_buffers[2].offset);
-            memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
-        });
+            });
+        }
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
+    }
+    // Depth writes, or a stencil test (its operations can write): what the feedback loop
+    // barrier (TextureCacheRuntime::BarrierFeedbackLoop) has to make visible.
+    if (maxwell3d->regs.zeta_enable != 0 &&
+        (maxwell3d->regs.depth_write_enabled != 0 || maxwell3d->regs.stencil_enable != 0)) {
+        scheduler.NoteDepthStencilWrite();
     }
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
@@ -1129,7 +1262,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     const auto rescaling_data = rescaling.Data();
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
-                      rescaling_data, is_rescaling, update_rescaling,
+                      mesh_set_slot, rescaling_data, is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
                       render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
@@ -1169,9 +1302,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         }
         if (mesh_emulation) {
             // The set the emulation's dispatch committed (see above).
-            if (mesh_descriptor_set) {
+            if (mesh_set_slot && *mesh_set_slot) {
                 cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
-                                          mesh_descriptor_set, nullptr);
+                                          *mesh_set_slot, nullptr);
             }
             return;
         }
@@ -1543,10 +1676,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         };
         dynamic_states.insert(dynamic_states.end(), extended.begin(), extended.end());
 
-        // VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT
-        if (!key.state.dynamic_vertex_input) {
-            dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT);
-        }
+        // Buffer binding sets strides with vkCmdBindVertexBuffers2 even when vertex input
+        // is dynamic. Both states must be enabled; the last setter supplies the stride.
+        dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT);
     }
 
     // VK_DYNAMIC_STATE_VERTEX_INPUT_EXT

@@ -61,6 +61,10 @@ public:
 
     [[nodiscard]] bool IsRegionUsed(u64 offset, u64 size) const noexcept;
 
+    /// Whether the region was used since the last render pass ended (Scheduler::PassEpoch): by
+    /// a draw of the current pass, its first draw's bindings, or a hoisted upload.
+    [[nodiscard]] bool IsRegionUsedInPass(u64 offset, u64 size) const noexcept;
+
     void MarkUsage(u64 offset, u64 size) noexcept;
 
     void ResetUsageTracking() noexcept {
@@ -88,8 +92,10 @@ private:
     vk::Buffer buffer;
     std::vector<BufferView> views;
     VideoCommon::UsageTracker tracker;
+    VideoCommon::UsageTracker pass_tracker; ///< usage within the held render pass
     VkDeviceAddress device_address{};
     u64 last_usage_tick{};
+    u64 pass_epoch{};
     bool is_null{};
     bool sparse_compatible{};
 };
@@ -146,7 +152,7 @@ public:
 
     [[nodiscard]] StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
-    bool CanReorderUpload(const Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies);
+    bool CanReorderUpload(Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies);
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
@@ -304,6 +310,10 @@ public:
     }
 
 private:
+    /// Set by CanReorderUpload for the CopyBuffer that follows it: the upload can run before
+    /// the held render pass.
+    bool hoist_next_upload{};
+
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
         if (handle == VK_NULL_HANDLE) {

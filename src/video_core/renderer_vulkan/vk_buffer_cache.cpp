@@ -100,7 +100,8 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
 } // Anonymous namespace
 
 Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_params)
-    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096} {
+    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096},
+      pass_tracker{4096} {
     if (runtime.device.HasNullDescriptor()) {
         return;
     }
@@ -118,7 +119,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
       scheduler{&runtime.scheduler},
       buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
                           runtime.SparseAlignmentFor(sparse_compatible_))},
-      tracker{SizeBytes()} {
+      tracker{SizeBytes()}, pass_tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
     if (runtime.device.HasDebuggingToolAttached()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
@@ -142,6 +143,18 @@ void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
         last_usage_tick = current_tick;
     }
     tracker.Track(offset, size);
+    if (const u64 epoch = scheduler->PassEpoch(); epoch != pass_epoch) {
+        pass_tracker.Reset();
+        pass_epoch = epoch;
+    }
+    pass_tracker.Track(offset, size);
+}
+
+bool Buffer::IsRegionUsedInPass(u64 offset, u64 size) const noexcept {
+    if (scheduler->PassEpoch() != pass_epoch) {
+        return false;
+    }
+    return pass_tracker.IsUsed(offset, size);
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {
@@ -545,7 +558,18 @@ void BufferCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
-bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
+namespace {
+// EDEN_NX2_UPLOAD_HOIST=0: in-order buffer uploads end the render pass, as before.
+bool UploadHoistEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_UPLOAD_HOIST");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // namespace
+
+bool BufferCacheRuntime::CanReorderUpload(Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {
         return false;
@@ -554,6 +578,20 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
         std::ranges::all_of(copies, [&](const VideoCommon::BufferCopy& copy) {
             return !buffer.IsRegionUsed(copy.dst_offset, copy.size);
         });
+    // Used earlier in the submission: the upload must come after that use. If no draw of the
+    // held render pass used it yet, it can run just before that pass instead of ending it
+    // (CopyBuffer). Its destination then counts as used in the pass, so a second upload of the
+    // same bytes, or one after a draw read them, keeps its place.
+    hoist_next_upload = false;
+    if (!can_use_upload_cmdbuf && UploadHoistEnabled() && scheduler.CanHoistUpload() &&
+        std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
+            return buffer.IsRegionUsedInPass(copy.dst_offset, copy.size);
+        })) {
+        hoist_next_upload = true;
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            buffer.MarkUsage(copy.dst_offset, copy.size);
+        }
+    }
     return can_use_upload_cmdbuf;
 }
 
@@ -584,6 +622,17 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                              vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
             upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         });
+        return;
+    }
+    if (std::exchange(hoist_next_upload, false) && src_buffer == staging_pool.StreamBuf() &&
+        scheduler.CanHoistUpload()) {
+        // Before the held render pass (CanReorderUpload); the scheduler puts the barriers
+        // around all of the pass's hoisted uploads.
+        scheduler.RecordBeforeRenderPass(
+            Scheduler::PrePassStage::Upload,
+            [src_buffer, dst_buffer, vk_copies](vk::CommandBuffer cmdbuf) {
+                cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+            });
         return;
     }
 

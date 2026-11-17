@@ -214,6 +214,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Selects whether the emulator should prefer to conserve memory or make maximum usage "
               "of available video memory for performance.\nAggressive mode may impact performance "
               "of other applications such as recording software."));
+    INSERT(Settings, vram_reserve_mib, tr("VRAM Reserve (MiB):"),
+           tr("Video memory kept free of what the driver allows the emulator, in MiB.\n-1 is "
+              "automatic: an eighth of it, at most 1024 MiB. Less reserve leaves more room for "
+              "textures, but other programs and the driver may then need to page memory."));
     INSERT(Settings, skip_cpu_inner_invalidation, tr("Skip CPU Inner Invalidation"),
            tr("Skips certain cache invalidations during memory updates, reducing CPU usage and "
               "improving latency. This may cause soft-crashes."));

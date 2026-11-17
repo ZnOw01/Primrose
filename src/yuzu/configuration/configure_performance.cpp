@@ -14,18 +14,18 @@
 #include <QFrame>
 #include <QGridLayout>
 #include <QGroupBox>
+#include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QStackedWidget>
-#include <QHBoxLayout>
 #include <QVBoxLayout>
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
-#include "yuzu/configuration/shared_widget.h"
 #include "yuzu/configuration/configure_performance.h"
+#include "yuzu/configuration/shared_widget.h"
 #include "yuzu/nx2_switches.h"
 
 namespace Performance {
@@ -85,7 +85,8 @@ Verdict HostImportVerdict(const Context& context) {
             return verdict;
         }
     } else {
-        verdict.note = QObject::tr("Support could not be checked: no graphics device was detected.");
+        verdict.note =
+            QObject::tr("Support could not be checked: no graphics device was detected.");
     }
     if (context.windows) {
         verdict.note = QObject::tr("Not verified on Windows yet. If the driver refuses the "
@@ -120,6 +121,35 @@ std::vector<Feature> FeaturesFor(Platform platform) {
                     "instead when the driver refuses. On by default with the NVIDIA proprietary "
                     "driver on Linux; add EDEN_NX2_HOST_IMPORT=0 to turn it off there."),
          host_import_recommended, HostImportVerdict});
+    features.push_back(
+        {"EDEN_NX2_OOT_AA", "0", QT_TR_NOOP("Replace Ocarina of Time's anti-aliasing"),
+         QT_TR_NOOP("Without DLSS, Ocarina of Time's own anti-aliasing pass runs after "
+                    "tonemapping (14.8 ms a frame at 1440p on an RX 580). This replaces it with "
+                    "a bilinear copy of its input: faster, with more aliasing. With DLSS active "
+                    "it changes nothing. Meant for GPUs that cannot keep up."),
+         false, [](const Context&) {
+             Verdict verdict;
+             verdict.note = QObject::tr("Lower image quality; leave it off on GPUs that keep up.");
+             return verdict;
+         }});
+    if (platform == Platform::Amd) {
+        // tested by Octelly on Linux, RX 6600
+        features.push_back(
+            {"EDEN_NX2_FENCE_WAIT", "host", QT_TR_NOOP("Wait for the frame fence on the host"),
+             QT_TR_NOOP(
+                 "The present waits for its own GPU fence on the host instead of sleeping in "
+                 "the guest kernel on an event. A channel suspended on a semaphore cannot "
+                 "then wedge the guest while the fence is waited for: without it, Splatoon "
+                 "Raiders freezes on AMD a few seconds after load and Mario Kart World"
+                 "deadlocked about one boot in three."),
+             platform == Platform::Amd, [](const Context& context) {
+                 Verdict verdict;
+                 verdict.note = QObject::tr(
+                     "This was measured on RADV on Linux; other drivers may "
+                     "behave differently. Please report if it does not work on your AMD GPU.");
+                 return verdict;
+             }});
+    }
     if (platform == Platform::Nvidia) {
         features.push_back(
             {"EDEN_NX2_BANK_REUPLOAD", "0", QT_TR_NOOP("Skip the once-per-frame bank re-upload"),
@@ -300,8 +330,8 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
                                    "whether these arguments fit it. They may have no effect or "
                                    "slow the game down.");
     } else if (context.device->capabilities.vendor_id != PlatformVendor(platform)) {
-        device_warning = tr("Your primary GPU (%1) is not a %2 GPU.")
-                             .arg(device_name, PlatformName(platform));
+        device_warning =
+            tr("Your primary GPU (%1) is not a %2 GPU.").arg(device_name, PlatformName(platform));
         device_warning_detail =
             tr("These arguments were chosen for %1 hardware and may have no effect or a negative "
                "effect on your gameplay.")
@@ -348,8 +378,8 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
 
         QStringList details{tr(feature.description)};
         if (unsupported) {
-            details.append(tr("⚠ Not supported with this configuration: %1")
-                               .arg(verdict.unsupported));
+            details.append(
+                tr("⚠ Not supported with this configuration: %1").arg(verdict.unsupported));
         } else if (!verdict.note.isEmpty()) {
             details.append(QStringLiteral("ⓘ ") + verdict.note);
         }
@@ -362,8 +392,9 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
             QStringLiteral("<p><b>%1</b><br><code>%2</code></p><p>%3</p>")
                 .arg(tr(feature.title).toHtmlEscaped(),
                      QString::fromStdString(row.line).toHtmlEscaped(),
-                     details.join(QStringLiteral("\n")).toHtmlEscaped().replace(
-                         QStringLiteral("\n"), QStringLiteral("</p><p>")));
+                     details.join(QStringLiteral("\n"))
+                         .toHtmlEscaped()
+                         .replace(QStringLiteral("\n"), QStringLiteral("</p><p>")));
 
         row.box = new QCheckBox(tr(feature.title), frame);
         row.box->setToolTip(tooltip);
@@ -430,8 +461,9 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
     footer->setWordWrap(true);
     footer->setEnabled(false);
     footer->setToolTip(
-        tr("Written to %1, which the emulator reads when it starts. The recommendations come from "
-           "measurements on NVIDIA hardware on Linux; other platforms have not been measured.")
+        tr("Written to %1, which the emulator reads when it starts. The NVIDIA recommendations "
+           "come from measurements on NVIDIA hardware on Linux; the AMD fence wait was measured "
+           "on one RADV system. Other platforms have not been measured.")
             .arg(QString::fromStdString(State::SwitchFilePath().string())));
     layout->addWidget(footer);
     layout->addStretch(1);
@@ -548,10 +580,9 @@ ConfigureGpu::ConfigureGpu(Performance::State& state,
     scroll->setWidget(pages);
     layout->addWidget(scroll, 1);
 
-    connect(vendor_combo, &QComboBox::currentIndexChanged, pages,
-            &QStackedWidget::setCurrentIndex);
-    const int start = static_cast<int>(
-        std::find(platforms.begin(), platforms.end(), detected) - platforms.begin());
+    connect(vendor_combo, &QComboBox::currentIndexChanged, pages, &QStackedWidget::setCurrentIndex);
+    const int start = static_cast<int>(std::find(platforms.begin(), platforms.end(), detected) -
+                                       platforms.begin());
     vendor_combo->setCurrentIndex(start);
     pages->setCurrentIndex(start);
 }
@@ -592,8 +623,9 @@ ConfigureShaders::ConfigureShaders(const Core::System& system_,
     };
 
     add_group(tr("Compilation"), {&values.use_asynchronous_shaders, &values.use_mesh_shaders});
-    add_group(tr("Caches"), {&values.use_disk_shader_cache, &values.use_vulkan_driver_pipeline_cache,
-                             &values.driver_shader_cache_size});
+    add_group(tr("Caches"),
+              {&values.use_disk_shader_cache, &values.use_vulkan_driver_pipeline_cache,
+               &values.driver_shader_cache_size});
     layout->addStretch(1);
 }
 

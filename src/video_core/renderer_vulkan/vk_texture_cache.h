@@ -284,6 +284,8 @@ public:
         u64 tick;
         vk::Image image;
         std::vector<vk::ImageView> views;
+        /// Per level and layer (level * layers + layer), for layer-chunked decodes.
+        std::vector<vk::ImageView> layer_views;
         u32 width;
         u32 height;
         u32 levels;
@@ -293,6 +295,10 @@ public:
     std::deque<PendingTranscode> pending_transcodes;
     /// Decode images the GPU is done with, for the next texture of the same shape.
     std::vector<PendingTranscode> free_transcodes;
+    /// RGBA8 bytes of a decode image.
+    static u64 TranscodeDecodeBytes(const PendingTranscode& t);
+    /// Moves finished decode images to free_transcodes (within its limit) or destroys them.
+    void RecycleTranscodes();
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     std::optional<PlainUnswizzlePass> plain_unswizzle_pass;

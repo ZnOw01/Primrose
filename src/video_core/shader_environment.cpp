@@ -447,8 +447,9 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
 Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                                              bool via_header_index, u32 raw) {
     const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
-    const u32 index{Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
-                                                       gpu_memory->UsesNativeTiling())};
+    const u32 index{Tegra::Texture::TextureHeaderIndex(
+        handle.first, tic_limit,
+        Tegra::Texture::UsesHeaderByteOffsetHandles(gpu_memory->UsesNativeTiling()))};
     if (index > tic_limit) {
         return {};
     }
@@ -890,8 +891,9 @@ Tegra::Texture::TICEntry GraphicsEnvironment::ReadTextureDescriptor(u32 handle) 
 
 Tegra::Texture::TICEntry GraphicsEnvironment::ReadSnapshotDescriptor(u32 handle) const {
     const auto pair{Tegra::Texture::TexturePair(handle, snapshot->via_header_index)};
-    const u32 index{Tegra::Texture::TextureHeaderIndex(pair.first, snapshot->texture_pool_limit,
-                                                       snapshot->native_tiling)};
+    const u32 index{Tegra::Texture::TextureHeaderIndex(
+        pair.first, snapshot->texture_pool_limit,
+        Tegra::Texture::UsesHeaderByteOffsetHandles(snapshot->native_tiling))};
     ASSERT(index <= snapshot->texture_pool_limit);
     Tegra::Texture::TICEntry entry{};
     if (index <= snapshot->texture_pool_limit) {

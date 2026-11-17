@@ -343,7 +343,6 @@ private:
     std::optional<MeshEmulationSetup> mesh_emulation;
     vk::ShaderModule mesh_vertex_module;
     vk::Pipeline mesh_compute_pipeline;
-    VkDescriptorSet mesh_descriptor_set{}; ///< shared by the dispatch and the draw it feeds
     VkBuffer mesh_output_buffer{};
     VkDeviceSize mesh_output_offset{};
     VkDeviceSize mesh_output_size{};

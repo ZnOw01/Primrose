@@ -566,6 +566,15 @@ struct Values {
                                                            VramUsageMode::Conservative,
                                                            "vram_usage_mode",
                                                            Category::RendererAdvanced};
+    // Video memory kept free of the driver's budget, in MiB. -1: automatic (an eighth of the
+    // budget, at most 1 GiB). Used for the reported VRAM and the texture cache's margin.
+    SwitchableSetting<int, true> vram_reserve_mib{linkage,
+                                                  -1,
+                                                  -1,
+                                                  4096,
+                                                  "vram_reserve_mib",
+                                                  Category::RendererAdvanced,
+                                                  Specialization::Countable};
 
     SwitchableSetting<NvdecEmulation> nvdec_emulation{linkage, NvdecEmulation::Cpu,
                                                       "nvdec_emulation", Category::RendererAdvanced};
@@ -1056,6 +1065,10 @@ bool CurrentProgramIsSwitch2();
 // The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
 // for the running program (the configuration is left as is). The core clears it on load.
 AstcRecompression GetAstcRecompression();
+
+// The video memory to keep free of a driver budget: vram_reserve_mib, or with -1 an eighth of
+// the budget, at most 1 GiB. Never more than the budget.
+u64 GetVramReserve(u64 budget);
 void SetAstcRecompressionOverride(std::optional<AstcRecompression> recompression);
 
 bool IsOpenGL();

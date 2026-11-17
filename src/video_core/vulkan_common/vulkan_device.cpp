@@ -1903,7 +1903,7 @@ void Device::CollectPhysicalMemoryInfo() {
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
         device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
     } else {
-        const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
+        const u64 reserve_memory = Settings::GetVramReserve(device_access_memory);
         device_access_memory -= reserve_memory;
         if (Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive) {
             // Account for resolution scaling in memory limits

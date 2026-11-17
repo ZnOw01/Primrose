@@ -152,6 +152,8 @@ add_library(
     stb.h
     steady_clock.cpp
     steady_clock.h
+    terminate_handler.cpp
+    terminate_handler.h
     stream.cpp
     stream.h
     string_util.cpp

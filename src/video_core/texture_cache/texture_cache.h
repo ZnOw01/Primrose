@@ -453,7 +453,7 @@ void TextureCache<P>::TickFrame() {
                 if (budget > 2_GiB || (budget != 0 && NativeTextureCacheBudgetEnabled())) {
                     native_heap_budget = budget;
                     const u64 old_critical = critical_memory;
-                    const u64 margin = (std::min)(budget / 8, 1_GiB);
+                    const u64 margin = Settings::GetVramReserve(budget);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
                         // blocks, which the driver counts and a full heap cannot hand to a new
@@ -1222,8 +1222,9 @@ template <class P>
 ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     auto& table =
         compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
-    index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
-                                               gpu_memory->UsesNativeTiling());
+    index = Tegra::Texture::TextureHeaderIndex(
+        index, table.current_limit,
+        Tegra::Texture::UsesHeaderByteOffsetHandles(gpu_memory->UsesNativeTiling()));
     if (index > table.current_limit) {
         LOG_TRACE(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;

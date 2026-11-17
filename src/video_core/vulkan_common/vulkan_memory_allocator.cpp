@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <limits>
 #include <optional>
@@ -88,6 +89,54 @@ namespace {
                 return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         }
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    }
+
+    // Buffers had no fallback when device memory ran out: the VK_ERROR_OUT_OF_DEVICE_MEMORY from
+    // vk::Check left the GPU thread and ended the process (an 8 GB RX 580 in Ocarina of Time).
+    // Like images: allow going over the budget, then use host memory, and only then fail.
+    VkResult CreateBufferWithFallback(VmaAllocator allocator, const VkBufferCreateInfo& ci,
+                                      const VmaAllocationCreateInfo& alloc_ci,
+                                      VkDeviceSize min_alignment, VkBuffer& handle,
+                                      VmaAllocation& allocation, VmaAllocationInfo& alloc_info) {
+        const auto create = [&](const VmaAllocationCreateInfo& info) {
+            return min_alignment > 1
+                       ? vmaCreateBufferWithAlignment(allocator, &ci, &info, min_alignment, &handle,
+                                                      &allocation, &alloc_info)
+                       : vmaCreateBuffer(allocator, &ci, &info, &handle, &allocation, &alloc_info);
+        };
+        VkResult result = create(alloc_ci);
+        if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            return result;
+        }
+        static std::atomic<u32> logged{};
+        VmaAllocationCreateInfo relaxed = alloc_ci;
+        relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = create(relaxed);
+        if (result == VK_SUCCESS) {
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Buffer of {} bytes is over the memory budget; allocating it anyway",
+                            ci.size);
+            }
+            return result;
+        }
+        VmaAllocationCreateInfo host = relaxed;
+        host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        host.preferredFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        host.requiredFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        result = create(host);
+        if (result == VK_SUCCESS) {
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Buffer of {} bytes is out of device memory; placed in host memory",
+                            ci.size);
+            }
+            return result;
+        }
+        LOG_CRITICAL(Render_Vulkan,
+                     "Buffer of {} bytes (usage {:#x}) failed in device and host memory: {}",
+                     ci.size, static_cast<u32>(ci.usage), static_cast<int>(result));
+        return result;
     }
 } // namespace
 
@@ -440,7 +489,8 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+        vk::Check(CreateBufferWithFallback(allocator, ci, alloc_ci, 1, handle, allocation,
+                                           alloc_info));
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
@@ -497,8 +547,8 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
-                                           &allocation, &alloc_info));
+    vk::Check(CreateBufferWithFallback(allocator, ci, alloc_ci, min_alignment, handle,
+                                       allocation, alloc_info));
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
