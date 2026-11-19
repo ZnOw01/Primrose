@@ -222,6 +222,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     QLayout& graphics_layout = *ui->graphics_widget->layout();
 
     std::map<u32, QWidget*> hold_graphics;
+    std::map<u32, QWidget*> hold_display;
     std::vector<QWidget*> hold_api;
     QCheckBox* dlss_checkbox = nullptr;
     ConfigurationShared::Widget* dlss_quality_widget = nullptr;
@@ -359,6 +360,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             dlss_quality_widget = widget;
             hold_graphics.emplace(setting->Id(), widget);
 #endif
+        } else if (setting->Id() == Settings::values.fullscreen_mode.Id() ||
+                   setting->Id() == Settings::values.fullscreen_on_launch.Id()) {
+            hold_display.emplace(setting->Id(), widget);
         } else if (setting->Id() == Settings::values.scaling_filter.Id()) {
             scaling_filter_widget = widget;
             hold_graphics.emplace(setting->Id(), widget);
@@ -372,6 +376,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 
     for (const auto& [id, widget] : hold_graphics) {
         graphics_layout.addWidget(widget);
+    }
+    for (const auto& [id, widget] : hold_display) {
+        ui->display_widget->layout()->addWidget(widget);
     }
 
     if (dlss_checkbox != nullptr) {

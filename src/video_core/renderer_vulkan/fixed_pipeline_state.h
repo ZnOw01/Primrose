@@ -264,6 +264,9 @@ struct FixedPipelineState {
     u32 line_stipple_factor;
     u32 line_stipple_pattern;
 
+    static void SetupDirtyRegisters(Tegra::Engines::Maxwell3D& maxwell3d,
+                                    const DynamicFeatures& features);
+
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
 
     size_t Hash() const noexcept;

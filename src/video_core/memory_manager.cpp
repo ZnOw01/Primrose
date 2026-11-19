@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <vector>
 
 #include "common/alignment.h"
@@ -311,9 +312,46 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
     const u64 owner_id = (u64{unique_identifier} << 1) | 1; // Never 0, the empty slot
     const u64 page = gpu_addr >> SubpageBits;
     const u64 serial = map_serial.load(std::memory_order_acquire);
+    static constexpr bool cache_runs = true;
+    struct CachedRun {
+        u64 owner{};
+        u64 serial{};
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        DAddr device_addr{};
+    };
+    static thread_local CachedRun last_run;
+    const bool use_runs = use_cache && cache_runs &&
+                          VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds);
+    if (use_runs && last_run.owner == owner_id && last_run.serial == serial &&
+        last_run.begin <= gpu_addr && gpu_addr < last_run.end) [[likely]] {
+        return last_run.device_addr + (gpu_addr - last_run.begin);
+    }
     CachedPage& slot = cache[(page ^ (page >> 11)) % CacheSize];
     if (use_cache && slot.owner == owner_id && slot.page == page && slot.serial == serial) [[likely]] {
         return slot.device_page + (gpu_addr & SubpageMask);
+    }
+    if (use_runs) {
+        const auto& runs = CurrentSnapshot().runs;
+        auto it = std::upper_bound(runs.begin(), runs.end(), gpu_addr,
+                                  [](GPUVAddr address, const MappingSnapshot::Run& run) {
+                                      return address < run.begin;
+                                  });
+        if (it != runs.begin()) {
+            const auto& run = *std::prev(it);
+            constexpr u64 DeviceLimit = u64{1} << MaxwellDeviceMemoryManager::AS_BITS;
+            // Cache translations only, never pointers or guest bytes. Clip invalid device space.
+            const GPUVAddr end = run.device_addr < DeviceLimit
+                                    ? run.begin + (std::min)(run.end - run.begin,
+                                                            DeviceLimit - run.device_addr)
+                                    : run.begin;
+            if (gpu_addr < end) {
+                last_run = {owner_id, serial, run.begin, end, run.device_addr};
+                const DAddr result = run.device_addr + (gpu_addr - run.begin);
+                slot = CachedPage{owner_id, serial, page, result - (gpu_addr & SubpageMask)};
+                return result;
+            }
+        }
     }
     std::optional<DAddr> result;
     if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
@@ -642,6 +680,15 @@ void MemoryManager::WriteBlock(GPUVAddr gpu_dest_addr, const void* src_buffer, s
 }
 
 void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
+    static constexpr bool short_write = true;
+    if (short_write && size != 0 && size <= page_size - (gpu_dest_addr & page_mask) &&
+        (gpu_dest_addr + size <= Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+         gpu_dest_addr >= Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))) {
+        if (u8* const pointer = GetPointer(gpu_dest_addr)) {
+            std::memcpy(pointer, src_buffer, size);
+            return;
+        }
+    }
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
 }
 
@@ -866,7 +913,7 @@ const MemoryManager::MappingSnapshot& MemoryManager::CurrentSnapshot() const {
         auto next = std::make_shared<MappingSnapshot>();
         next->runs.reserve(continuous_runs.size());
         for (const auto& [begin, run] : continuous_runs) {
-            next->runs.push_back({begin, run.end});
+            next->runs.push_back({begin, run.end, run.device_addr});
         }
         {
             std::unique_lock<std::mutex> kind_lock(guard);
@@ -1157,10 +1204,36 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 }
 
 void MemoryManager::FlushCaching() {
+    static constexpr bool short_range = true;
     // Flush from the invalidate accumulator
     if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
-        GetSubmappedRangeImpl<false>(addr, size, page_stash2);
-    })) {
+            if (short_range && size != 0 && size <= page_size - (addr & page_mask)) {
+                if (const auto device = GpuToCpuAddress(addr)) {
+                    page_stash2.emplace_back(*device, size);
+                    return;
+                }
+            }
+            GetSubmappedRangeImpl<false>(addr, size, page_stash2);
+        })) {
+        static constexpr bool coalesce = true;
+        if (coalesce && page_stash2.size() > 1) {
+            static constexpr bool check_sorted = true;
+            if (!check_sorted || !std::is_sorted(page_stash2.begin(), page_stash2.end())) {
+                std::sort(page_stash2.begin(), page_stash2.end());
+            }
+            size_t count = 0;
+            for (const auto range : page_stash2) {
+                if (count != 0 && range.first <= page_stash2[count - 1].first +
+                                                   page_stash2[count - 1].second) {
+                    auto& previous = page_stash2[count - 1];
+                    previous.second = (std::max)(previous.first + previous.second,
+                                                 range.first + range.second) - previous.first;
+                } else {
+                    page_stash2[count++] = range;
+                }
+            }
+            page_stash2.resize(count);
+        }
         rasterizer->InnerInvalidation(page_stash2);
         page_stash2.clear();
     }

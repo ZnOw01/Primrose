@@ -77,6 +77,9 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
         if (setting->Id() == Settings::values.enable_compute_pipelines.Id()) {
             checkbox_enable_compute_pipelines = widget;
         }
+        if (setting->Id() == Settings::values.mesh_shader_mode.Id()) {
+            mesh_shader_mode = widget;
+        }
     }
 
     for (const auto& [id, widget] : normal_hold) {
@@ -101,6 +104,11 @@ void ConfigureGraphicsAdvanced::changeEvent(QEvent* event) {
 
 void ConfigureGraphicsAdvanced::RetranslateUI() {
     ui->retranslateUi(this);
+}
+
+void ConfigureGraphicsAdvanced::SetUpMeshShaderMode(
+    const std::vector<VkDeviceInfo::Record>& records) {
+    ConfigureShaders::SetUpMeshShaderMode(mesh_shader_mode, records, apply_funcs);
 }
 
 void ConfigureGraphicsAdvanced::ExposeComputeOption() {

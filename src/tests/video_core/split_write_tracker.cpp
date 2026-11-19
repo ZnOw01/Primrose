@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <random>
+#include <string_view>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -219,4 +220,74 @@ TEST_CASE("Split write tracker matches a model of every queued entry",
             }
         }
     }
+}
+
+TEST_CASE("Split acquires use only the newest pending exact release word",
+          "[video_core][split_writes][split_correctness]") {
+    SplitWriteTracker tracker;
+    tracker.Write(0x1000, 0x2000, 10);
+    tracker.Release(0x1040, 10, 7);
+    REQUIRE(tracker.ReleaseTo(0x1040, 0, false));
+    CHECK(tracker.ReleaseTo(0x1040, 0, false)->value == 7);
+    CHECK_FALSE(tracker.ReleaseTo(0x1044, 0, false));
+    tracker.Release(0x1044, 10, 0);
+    REQUIRE(tracker.ReleaseTo(0x1044, 0, false));
+    CHECK(tracker.ReleaseTo(0x1044, 0, false)->value == 0);
+    CHECK_FALSE(tracker.ReleaseTo(0x1040, 10, false));
+
+    tracker.Write(0x1000, 0x2000, 20);
+    CHECK_FALSE(tracker.ReleaseTo(0x1040, 0, false));
+    tracker.Release(0x1040, 20, 9);
+    REQUIRE(tracker.ReleaseTo(0x1040, 0, false));
+    CHECK(tracker.ReleaseTo(0x1040, 0, false)->value == 9);
+    tracker.Write(0x1000, 0x2000, 20);
+    CHECK_FALSE(tracker.ReleaseTo(0x1040, 0, false));
+    tracker.Release(0x1040, 20, 9);
+    tracker.Retire(20);
+    CHECK_FALSE(tracker.ReleaseTo(0x1040, 20, false));
+}
+
+TEST_CASE("Split known releases follow earlier work and retain later barriers",
+          "[video_core][split_writes][split_correctness]") {
+    for (const Effect effect : {Effect::Unknown, Effect::Gpu, Effect::Draw}) {
+        SplitWriteTracker tracker;
+        tracker.Entry(effect, 5);
+        tracker.Write(0x1000, 0x2000, 10);
+        tracker.Release(0x1040, 10, 1);
+        // The release is queued after this work and supplies the final payload.
+        REQUIRE(tracker.ReleaseTo(0x1040, 0, false));
+        CHECK(tracker.ReleaseTo(0x1040, 0, false)->value == 1);
+        CHECK(tracker.ReleaseTo(0x1040, 5, false));
+        tracker.Entry(effect, 15);
+        CHECK_FALSE(tracker.ReleaseTo(0x1040, 0, false));
+        if (effect != Effect::Draw) {
+            CHECK_FALSE(tracker.ReleaseTo(0x1040, 0, true));
+        }
+    }
+}
+
+TEST_CASE("Split release predictions can skip only validated nonwriter draws",
+          "[video_core][split_writes][split_correctness]") {
+    SplitWriteTracker tracker;
+    tracker.Write(0x1000, 0x2000, 10);
+    tracker.Release(0x1040, 10, 1);
+    tracker.DrawEpoch(4);
+    tracker.Entry(Effect::Draw, 15);
+    CHECK_FALSE(tracker.ReleaseTo(0x1040, 0, false));
+    REQUIRE(tracker.DrawsValid(0, 4));
+    CHECK(tracker.ReleaseTo(0x1040, 0, true));
+    CHECK_FALSE(tracker.DrawsValid(0, 5));
+}
+
+TEST_CASE("Split release metadata is bounded and reset with the ring",
+          "[video_core][split_writes][split_correctness]") {
+    SplitWriteTracker tracker;
+    for (u64 position = 1; position <= SplitWriteTracker::MaxWrites + 1; ++position) {
+        tracker.Write(0x1000, 0x2000, position);
+        tracker.Release(0x1040, position, static_cast<u32>(position));
+    }
+    REQUIRE(tracker.ReleaseTo(0x1040, 0, false));
+    CHECK(tracker.ReleaseTo(0x1040, 0, false)->value == SplitWriteTracker::MaxWrites + 1);
+    tracker.Reset();
+    CHECK_FALSE(tracker.ReleaseTo(0x1040, 0, false));
 }

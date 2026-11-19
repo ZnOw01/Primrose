@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -259,7 +260,59 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
+bool MemoryAllocator::CreateImageInSeparatePool(const VkImageCreateInfo& ci,
+                                                const VmaAllocationCreateInfo& alloc_ci,
+                                                VkImage& handle, VmaAllocation& allocation,
+                                                VmaAllocationInfo& info) const {
+    static constexpr bool enabled = true;
+    if (!enabled) {
+        return false;
+    }
+    const auto& dld = device.GetDispatchLoader();
+    const auto logical = *device.GetLogical();
+    const auto get_requirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(
+        dld.vkGetDeviceProcAddr(logical, "vkGetImageMemoryRequirements2"));
+    if (get_requirements == nullptr ||
+        dld.vkCreateImage(logical, &ci, nullptr, &handle) != VK_SUCCESS) {
+        return false;
+    }
+    VkMemoryDedicatedRequirements dedicated{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+    };
+    VkMemoryRequirements2 requirements{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+        .pNext = &dedicated,
+    };
+    const VkImageMemoryRequirementsInfo2 image_info{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+        .image = handle,
+    };
+    get_requirements(logical, &image_info, &requirements);
+    const auto& memory = requirements.memoryRequirements;
+    VmaAllocationCreateInfo pool_ci = alloc_ci;
+    pool_ci.usage = VMA_MEMORY_USAGE_UNKNOWN;
+    pool_ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    u32 memory_type{};
+    // Keep the default small blocks and all required dedicated allocations.
+    if (!dedicated.requiresDedicatedAllocation && memory.size > Device::SeparatePoolBlockSize / 2 &&
+        memory.size <= Device::TransientImageBlockSize / 2 &&
+        vmaFindMemoryTypeIndex(allocator, memory.memoryTypeBits, &pool_ci, &memory_type) == VK_SUCCESS) {
+        pool_ci.pool = device.GetSeparatePool(Device::SeparatePool::TransientImages, memory_type);
+        if (pool_ci.pool != VK_NULL_HANDLE &&
+            vmaAllocateMemoryForImage(allocator, handle, &pool_ci, &allocation, &info) == VK_SUCCESS) {
+            if (vmaBindImageMemory(allocator, allocation, handle) == VK_SUCCESS) {
+                return true;
+            }
+        }
+    }
+    vmaDestroyImage(allocator, handle, allocation);
+    handle = VK_NULL_HANDLE;
+    allocation = VK_NULL_HANDLE;
+    return false;
+}
+
+vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                       bool transient) const
 {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
@@ -297,8 +350,15 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         huge = ShouldLeaveImageUnbacked(texels, requirements.size,
                                         device.GetDeviceLocalMemory());
     }
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!huge) {
+        if (transient && !dedicated &&
+            CreateImageInSeparatePool(ci, alloc_ci, handle, allocation, alloc_info)) {
+            result = VK_SUCCESS;
+        } else {
+            result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        }
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.

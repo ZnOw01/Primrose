@@ -22,6 +22,7 @@
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/shader_handle_program.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -229,14 +230,7 @@ public:
         return configure_func(this, is_indexed);
     }
 
-    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
-        if (key == current_key) {
-            return this;
-        }
-        const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
-        return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
-                                           : nullptr;
-    }
+    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept;
 
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
     void MarkUsed(u64 frame) noexcept {
@@ -286,6 +280,7 @@ private:
     void Validate();
 
     const GraphicsPipelineCacheKey key;
+    const size_t transition_hash{key.Hash()};
     Tegra::Engines::Maxwell3D* maxwell3d;
     Tegra::MemoryManager* gpu_memory;
     const Device& device;
@@ -300,13 +295,17 @@ private:
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
+    std::array<size_t, 16> transition_hashes{};
     u64 last_use_frame{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
+    std::array<std::vector<VideoCommon::TextureHandleCache>, NUM_STAGES> handle_caches;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
+    u64 nx2_skip_contents{}; ///< ... and its uniform bytes' hash
+    bool nx2_skip_seen{};
     u32 num_descriptor_entries{};
     size_t num_image_elements{};
     std::vector<SampledImage> sampled_images;
@@ -325,11 +324,16 @@ private:
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
     std::vector<u8> last_descriptor_bytes;
+    VkDeviceSize last_bound_descriptor_offset{};
+    u32 last_bound_descriptor_chunk{};
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
     std::array<u32, 6> last_rescaling_words{};
     bool has_pushed_rescaling{false};
+    u64 last_configure_recording_epoch{~u64{0}};
+    std::array<f32, 4> last_render_area_words{};
+    bool last_uses_render_area{};
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};

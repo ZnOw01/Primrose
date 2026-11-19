@@ -3205,7 +3205,6 @@ public:
         bool loaded{};
     } root_tables;
 
-
     /// Write the value to the register identified by method.
     void CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) override;
 
@@ -3221,7 +3220,9 @@ public:
 
     /// GpuSplit's back (fast_maxwell3d): processes a contiguous run of non-executable state
     /// register writes from the SPSC ring in one loop.
-    size_t CallStateMethodRun(const u64* entry, size_t max_words);
+    size_t CallStateMethodRun(const u64* entry, size_t max_words, bool tagged = false);
+    /// A compact ring block of consecutive state registers.
+    void CallStateMethodBlock(u32 method, const u32* arguments, u32 count);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
@@ -3229,7 +3230,8 @@ public:
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                              const u32* base_start, u32 amount, u32 methods_pending);
+                              const u32* base_start, u32 amount, u32 methods_pending,
+                              bool allow_borrow = true);
     /// Split front, before an entry holding the remaining 5 parameters (at `record`) of the
     /// pending macro call: true when that macro is DrawIndexedIndirect with a topology the host
     /// draws indirectly. The host GPU then reads the record itself (the words may still be
@@ -3274,6 +3276,8 @@ public:
 
         Flags flags;
         Tables tables{};
+        std::bitset<Regs::NUM_REGS> pipeline_state_registers{};
+        bool pipeline_state_dirty{true};
     } dirty;
 
     DrawManager draw_manager;
@@ -3461,6 +3465,8 @@ private:
     /// the back proved its exact programs write no memory, Gpu otherwise.
     VideoCommon::SplitWriteTracker::Effect FrontDrawEffect(VideoCommon::GpuSplit& split,
                                                            FrontState& state);
+    VideoCommon::SplitWriteTracker::Effect ComputeFrontDrawEffect(VideoCommon::GpuSplit &split,
+                                                                  FrontState &state);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

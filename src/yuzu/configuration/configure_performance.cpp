@@ -215,6 +215,10 @@ QString WarningStyle() {
 
 } // Anonymous namespace
 
+const VkDeviceInfo::Record* PrimaryDevice(const std::vector<VkDeviceInfo::Record>& records) {
+    return MakeContext(records).device;
+}
+
 State::State(QObject* parent) : QObject(parent) {
     std::ifstream file{SwitchFilePath()};
     std::string text;
@@ -590,7 +594,9 @@ ConfigureGpu::ConfigureGpu(Performance::State& state,
 ConfigureGpu::~ConfigureGpu() = default;
 
 ConfigureShaders::ConfigureShaders(const Core::System& system_,
-                                   const ConfigurationShared::Builder& builder, QWidget* parent)
+                                   const ConfigurationShared::Builder& builder,
+                                   const std::vector<VkDeviceInfo::Record>& records,
+                                   QWidget* parent)
     : Tab(nullptr, parent), system{system_} {
     setAccessibleName(tr("Shaders"));
     auto* const layout = new QVBoxLayout(this);
@@ -613,6 +619,9 @@ ConfigureShaders::ConfigureShaders(const Core::System& system_,
                 widget->deleteLater();
                 continue;
             }
+            if (setting == &values.mesh_shader_mode) {
+                SetUpMeshShaderMode(widget, records, apply_funcs);
+            }
             group_layout->addWidget(widget);
         }
         if (group_layout->count() == 0) {
@@ -622,7 +631,7 @@ ConfigureShaders::ConfigureShaders(const Core::System& system_,
         layout->addWidget(group);
     };
 
-    add_group(tr("Compilation"), {&values.use_asynchronous_shaders, &values.use_mesh_shaders});
+    add_group(tr("Compilation"), {&values.use_asynchronous_shaders, &values.mesh_shader_mode});
     add_group(tr("Caches"),
               {&values.use_disk_shader_cache, &values.use_vulkan_driver_pipeline_cache,
                &values.driver_shader_cache_size});
@@ -633,9 +642,51 @@ ConfigureShaders::~ConfigureShaders() = default;
 
 bool ConfigureShaders::IsShaderSetting(u32 id) {
     const auto& v = Settings::values;
-    return id == v.use_asynchronous_shaders.Id() || id == v.use_mesh_shaders.Id() ||
+    return id == v.use_asynchronous_shaders.Id() || id == v.mesh_shader_mode.Id() ||
            id == v.use_disk_shader_cache.Id() || id == v.use_vulkan_driver_pipeline_cache.Id() ||
            id == v.private_driver_shader_cache.Id() || id == v.driver_shader_cache_size.Id();
+}
+
+void ConfigureShaders::SetUpMeshShaderMode(ConfigurationShared::Widget* widget,
+                                           const std::vector<VkDeviceInfo::Record>& records,
+                                           std::vector<std::function<void(bool)>>& apply_funcs) {
+    const VkDeviceInfo::Record* const device = Performance::PrimaryDevice(records);
+    if (widget == nullptr || widget->combobox == nullptr || device == nullptr) {
+        return;
+    }
+    const auto& caps = device->capabilities;
+    const QString name = QString::fromStdString(device->name);
+    if (caps.HasExtension(VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
+        const bool amd_driver = caps.driver_id == VK_DRIVER_ID_MESA_RADV ||
+                                caps.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                caps.driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+        if (amd_driver) {
+            widget->setToolTip(
+                widget->toolTip() + QStringLiteral("\n\n") +
+                tr("%1 has an AMD driver: Auto uses the compute fallback.").arg(name));
+        }
+        return;
+    }
+    // Nothing to choose: show the fallback this GPU always uses, and keep the stored choice for
+    // another GPU instead of saving the fallback shown here.
+    auto& setting = Settings::values.mesh_shader_mode;
+    const bool was_global = setting.UsingGlobal();
+    const Settings::MeshShaderMode stored = setting.GetValue();
+    {
+        const QSignalBlocker blocker(widget->combobox);
+        widget->combobox->setCurrentIndex(widget->combobox->findData(
+            static_cast<u32>(Settings::MeshShaderMode::ComputeFallback)));
+    }
+    widget->setEnabled(false);
+    widget->setToolTip(widget->toolTip() + QStringLiteral("\n\n") +
+                       tr("%1 has no VK_EXT_mesh_shader, so its task/mesh draws always use the "
+                          "compute fallback.")
+                           .arg(name));
+    apply_funcs.push_back([was_global, stored](bool) {
+        auto& mode = Settings::values.mesh_shader_mode;
+        mode.SetGlobal(was_global);
+        mode.SetValue(stored);
+    });
 }
 
 void ConfigureShaders::ApplyConfiguration() {

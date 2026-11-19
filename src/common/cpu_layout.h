@@ -20,8 +20,6 @@ struct CpuThreadLayout {
     u64 foreground;
     u64 backend;
     u64 support;
-    /// The foreground core next below the backend's: the split's front gets it alone with
-    /// EDEN_NX2_CPU_LAYOUT=2 (it is still part of `foreground` here).
     u64 front{};
 };
 

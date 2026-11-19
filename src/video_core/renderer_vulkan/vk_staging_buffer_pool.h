@@ -77,6 +77,9 @@ private:
 
     struct StagingBuffers {
         std::vector<StagingBuffer> entries;
+        /// entries[i].tick, or the maximum while entries[i] is deferred: searching for a free
+        /// entry reads only this array (a download level can hold thousands of entries).
+        std::vector<u64> free_ticks;
         size_t delete_index = 0;
         size_t iterate_index = 0;
     };

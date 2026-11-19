@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/nx2_gpu_side.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -91,8 +92,11 @@ public:
                 group.src, group.dst,
                 vk::Span<VkBufferCopy>(batch_copies.data() + group.first, group.count));
         }
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
+        const auto dst_stages = VideoCommon::Nx2GpuSide::On(
+                                    VideoCommon::Nx2GpuSide::Opt::CopyBatch)
+                                    ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER_HOST
+                                    : vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER;
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stages, 0, WRITE_BARRIER);
     }
 
     void Add(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> new_copies) {

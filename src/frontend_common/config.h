@@ -193,6 +193,7 @@ protected:
     }
 
     void ReadCategory(Settings::Category category);
+    void MigrateMeshShaderSetting();
     void WriteCategory(Settings::Category category);
     void ReadSettingGeneric(Settings::BasicSetting* setting);
     void WriteSettingGeneric(const Settings::BasicSetting* setting);

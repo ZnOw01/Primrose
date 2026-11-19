@@ -118,6 +118,7 @@ void ConfigurePerGame::BuildSettingTabs() {
     cpu_tab = std::make_unique<ConfigureCpu>(system, tab_group, *builder, this);
     graphics_advanced_tab =
         std::make_unique<ConfigureGraphicsAdvanced>(system, tab_group, *builder, this);
+    graphics_advanced_tab->SetUpMeshShaderMode(vk_device_records);
     graphics_extensions_tab =
         std::make_unique<ConfigureGraphicsExtensions>(system, tab_group, *builder, this);
     graphics_tab = std::make_unique<ConfigureGraphics>(

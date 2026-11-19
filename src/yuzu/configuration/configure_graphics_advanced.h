@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 #include <QWidget>
+#include "qt_common/util/vk.h"
 #include "yuzu/configuration/configuration_shared.h"
 
 namespace Core {
@@ -18,6 +19,7 @@ class ConfigureGraphicsAdvanced;
 
 namespace ConfigurationShared {
 class Builder;
+class Widget;
 }
 
 class ConfigureGraphicsAdvanced : public ConfigurationShared::Tab {
@@ -33,6 +35,8 @@ public:
     void SetConfiguration() override;
 
     void ExposeComputeOption();
+    /// Locks the task/mesh shader dropdown to the compute fallback on a GPU without mesh shaders.
+    void SetUpMeshShaderMode(const std::vector<VkDeviceInfo::Record>& records);
 
 private:
     void Setup(const ConfigurationShared::Builder& builder);
@@ -46,4 +50,5 @@ private:
     std::vector<std::function<void(bool)>> apply_funcs;
 
     QWidget* checkbox_enable_compute_pipelines{};
+    ConfigurationShared::Widget* mesh_shader_mode{};
 };

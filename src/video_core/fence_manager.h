@@ -102,6 +102,7 @@ public:
         if constexpr (can_async_check) {
             guard.lock();
         }
+        const bool queue_was_empty = fences.empty();
         {
             std::scoped_lock lock{uncommitted_guard};
             if (delay_fence) {
@@ -109,7 +110,12 @@ public:
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
             uncommitted_operations.clear(); // moved-from: make it empty explicitly
-            uncommitted_operations.reserve(64);
+            if (ReuseOperationLists() && !operation_lists.empty()) {
+                uncommitted_operations = std::move(operation_lists.back());
+                operation_lists.pop_back();
+            } else {
+                uncommitted_operations.reserve(64);
+            }
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -122,7 +128,12 @@ public:
         }
         if constexpr (can_async_check) {
             guard.unlock();
-            cv.notify_all();
+            static constexpr bool notify_empty = true;
+            if (!notify_empty) {
+                cv.notify_all();
+            } else if (queue_was_empty) {
+                cv.notify_one();
+            }
         }
         rasterizer.InvalidateGPUCache();
     }
@@ -223,6 +234,10 @@ private:
             for (auto& operation : operations) {
                 operation();
             }
+            if (ReuseOperationLists()) {
+                operations.clear();
+                RecycleOperations(std::move(operations));
+            }
             {
                 std::unique_lock lock(ring_guard);
                 delayed_destruction_ring.Push(std::move(current_fence));
@@ -308,6 +323,15 @@ private:
                 for (auto& operation : released.operations) {
                     operation();
                 }
+                if (ReuseOperationLists()) {
+                    released.operations.clear();
+                }
+            }
+            if (ReuseOperationLists()) {
+                std::scoped_lock lock{guard};
+                for (Released& released : batch) {
+                    RecycleOperations(std::move(released.operations));
+                }
             }
             {
                 std::unique_lock lock(ring_guard);
@@ -353,6 +377,7 @@ private:
     /// with work, instead of holding both while it copies (the GPU thread's draws and uploads
     /// waited for it).
     CacheFlushes CommitCacheFlushes() {
+        static constexpr bool prune_empty = true;
         CacheFlushes flushes{};
         {
             std::scoped_lock lock{texture_cache.mutex};
@@ -365,9 +390,16 @@ private:
         {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.HasUncommittedFlushes()) {
-                buffer_cache.CommitAsyncFlushes();
-                flushes.should_flush = true;
-                flushes.committed |= BufferFlushes;
+                bool committed = true;
+                if (prune_empty) {
+                    committed = buffer_cache.CommitAsyncFlushesIfNeeded();
+                } else {
+                    buffer_cache.CommitAsyncFlushes();
+                }
+                if (committed) {
+                    flushes.should_flush = true;
+                    flushes.committed |= BufferFlushes;
+                }
             }
         }
         return flushes;
@@ -396,12 +428,24 @@ private:
         }
     }
 
+    static bool ReuseOperationLists() {
+        static constexpr bool enabled = true;
+        return enabled;
+    }
+
+    void RecycleOperations(std::vector<std::function<void()>>&& operations) {
+        if (operation_lists.size() < 64 && operations.capacity() != 0) {
+            operation_lists.emplace_back(std::move(operations));
+        }
+    }
+
     std::queue<TFence> fences;
     // LOCAL TEST (Zelda): vectors, not deques. MSVC's deque of std::function holds one element per
     // block, so every queued operation (one per query report, ~1000 objects a frame in Ocarina's
     // Kokiri Forest) allocated a block.
     using OperationList = std::vector<std::function<void()>>;
     OperationList uncommitted_operations;
+    std::vector<OperationList> operation_lists; ///< Protected by guard on async backends
     std::deque<OperationList> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)

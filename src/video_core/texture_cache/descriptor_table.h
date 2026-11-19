@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <utility>
 #include <vector>
 
 #include "common/alignment.h"
@@ -99,6 +101,78 @@ public:
             descriptors[index] = result.first;
         }
         return result;
+    }
+
+    template <class MemoryManager>
+    [[nodiscard]] std::pair<const T&, bool> ReadReference(const MemoryManager& gpu_memory,
+                                                        u32 index, bool graphics) noexcept {
+        static_assert(sizeof(T) == sizeof(std::declval<T>().raw));
+        static constexpr bool enabled = true;
+        if (!enabled || !graphics) {
+            const auto result = Read(gpu_memory, index);
+            return {descriptors[index], result.second};
+        }
+        DEBUG_ASSERT(index <= current_limit);
+        if (invalidated) {
+            ClearReadDescriptors();
+            invalidated = false;
+        }
+        const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+        const u64 page_offset = gpu_addr & Core::Memory::YUZU_PAGEMASK;
+        const u8* source = nullptr;
+        if (page_offset + sizeof(T) <= Core::Memory::YUZU_PAGESIZE) [[likely]] {
+            if constexpr (requires { gpu_memory.GetID(); gpu_memory.GetMapSerial(); }) {
+                const GPUVAddr page_addr = gpu_addr - page_offset;
+                auto& entry =
+                    page_cache[(page_addr >> Core::Memory::YUZU_PAGEBITS) & (PageCacheSize - 1)];
+                const size_t memory_id = gpu_memory.GetID();
+                const u64 map_serial = gpu_memory.GetMapSerial();
+                if (entry.page_addr != page_addr || entry.memory_id != memory_id ||
+                    entry.map_serial != map_serial || entry.host_ptr == nullptr) {
+                    entry = {page_addr, memory_id, map_serial, gpu_memory.GetPointer(page_addr)};
+                }
+                if (entry.host_ptr != nullptr) {
+                    source = entry.host_ptr + page_offset;
+                }
+            } else {
+                source = gpu_memory.GetPointer(gpu_addr);
+            }
+        }
+        T fallback;
+        if (source == nullptr) {
+            gpu_memory.ReadBlockUnsafe(gpu_addr, &fallback, sizeof(T));
+            source = reinterpret_cast<const u8*>(&fallback);
+        }
+        const u64 bit = u64{1} << (index % 64);
+        u64& seen = read_descriptors[index / 64];
+        static constexpr bool word_reads = true;
+        if (word_reads) {
+            static_assert(sizeof(T) == 4 * sizeof(u64));
+            std::array<u64, 4> words;
+            std::memcpy(&words[0], source, sizeof(u64));
+            std::memcpy(&words[1], source + sizeof(u64), sizeof(u64));
+            std::memcpy(&words[2], source + 2 * sizeof(u64), sizeof(u64));
+            std::memcpy(&words[3], source + 3 * sizeof(u64), sizeof(u64));
+            T& cached = descriptors[index];
+            const bool changed = (seen & bit) == 0 || words[0] != cached.raw[0] ||
+                                 words[1] != cached.raw[1] || words[2] != cached.raw[2] ||
+                                 words[3] != cached.raw[3];
+            if (changed) {
+                cached.raw[0] = words[0];
+                cached.raw[1] = words[1];
+                cached.raw[2] = words[2];
+                cached.raw[3] = words[3];
+                seen |= bit;
+            }
+            return {cached, changed};
+        }
+        const bool changed = (seen & bit) == 0 ||
+                             std::memcmp(source, &descriptors[index], sizeof(T)) != 0;
+        if (changed) {
+            std::memcpy(&descriptors[index], source, sizeof(T));
+            seen |= bit;
+        }
+        return {descriptors[index], changed};
     }
 
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {

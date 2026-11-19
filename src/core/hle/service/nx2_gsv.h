@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <bit>
 #include <thread>
 #include <chrono>
@@ -1648,6 +1649,37 @@ private:
     std::set<u32> m_logged;
 };
 
+// The session gsv 1121 returns (nn::gs::sdk::QueryApplicationGpuTimeSpan, Welcome Tour). The SDK
+// opens it once, checks it with 0(u64), which must echo the u64 back, then asks 11(u64, u64) for a
+// TimeSpan (nanoseconds) of the application's GPU time. No GPU time accounting exists here, so 11
+// answers zero.
+class INx2GpuTimeSession final : public ServiceFramework<INx2GpuTimeSession> {
+public:
+    explicit INx2GpuTimeSession(Core::System& system_) : ServiceFramework{system_, "nx2:gputime"} {
+        RegisterHandlersTipc({
+            {0, &INx2GpuTimeSession::Echo, "Check"},
+            {11, &INx2GpuTimeSession::QueryApplicationGpuTimeSpan, "QueryApplicationGpuTimeSpan"},
+        });
+    }
+
+private:
+    void Echo(HLERequestContext& ctx) {
+        TipcHandshake(ctx, "nx2:gputime");
+    }
+
+    void QueryApplicationGpuTimeSpan(HLERequestContext& ctx) {
+        const u32* w = ctx.CommandBuffer();
+        if (!m_logged) {
+            m_logged = true;
+            LOG_WARNING(Service, "(STUBBED) nx2:gputime TIPC 11 args {:#x} {:#x}, returning 0 ns",
+                        u64{w[2]} | (u64{w[3]} << 32), u64{w[4]} | (u64{w[5]} << 32));
+        }
+        TipcReplyWords(ctx, {0, 0});
+    }
+
+    bool m_logged{};
+};
+
 // Video decoder output images (nn::codec image pools, gsv 991/911/961). The preference
 // (MakeDecodeImagePreference) holds an output layout code at word 1 and (width - 1) |
 // (height - 1) << 16 at word 2. Codes come in pairs, one per CodecMode: 1/4 NV12 (format 3, what
@@ -1966,12 +1998,13 @@ private:
 
     /// Returns presentation fences instead of blocking the present thread until the next flip.
     /// This keeps the display wait out of Wonder's CPU frame measurement.
-    /// EDEN_NX2_PRESENT_QUEUE=0 restores blocking presentation pacing.
-    static bool PresentQueue() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("EDEN_NX2_PRESENT_QUEUE");
-            return value == nullptr || value[0] != '0';
-        }();
+    /// Off by default for Ocarina of Time; EDEN_NX2_PRESENT_QUEUE=0/1 overrides.
+    bool PresentQueue() const {
+        constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+        static const char* const forced = std::getenv("EDEN_NX2_PRESENT_QUEUE");
+        const bool enabled =
+            forced != nullptr ? forced[0] != '0'
+                              : system.GetApplicationProcessProgramID() != OcarinaOfTimeProgramId;
         // Single core: CoreTiming counts guest ticks, not wall time, so the release timer would
         // not pace in real time, and DoSpeedLimiting (skipped with the queue) is the only limiter.
         return enabled && Settings::values.use_multi_core.GetValue();
@@ -2078,6 +2111,7 @@ private:
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     std::chrono::steady_clock::time_point m_next_vblank{};
+    std::chrono::nanoseconds m_next_core_vblank{};
     u32 m_swap_word{};
     Nx2OotTime::FrameDelta m_oot_frame_delta;
     Nx2FrameInterval::Controller m_frame_interval;
@@ -2176,6 +2210,11 @@ private:
         return swap_interval;
     }
 
+    bool PresentCoreClock() const {
+        static constexpr bool enabled = true;
+        return enabled && kernel.IsMulticore();
+    }
+
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
@@ -2186,6 +2225,9 @@ private:
         const auto movie_now = std::chrono::steady_clock::now();
         if (m_objects->mkw_movie_activity.Active(movie_now)) {
             m_next_vblank = movie_now;
+            if (PresentCoreClock()) {
+                m_next_core_vblank = system.CoreTiming().GetGlobalTimeNs();
+            }
             return;
         }
         const u32 swap_interval = SwapInterval(timing);
@@ -2196,6 +2238,39 @@ private:
         }
         const auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        if (PresentCoreClock()) {
+            const auto now = system.CoreTiming().GetGlobalTimeNs();
+            auto core_interval = interval;
+            std::chrono::nanoseconds phase{}, period{};
+            {
+                std::scoped_lock lk{m_vsync->mutex};
+                if (!m_vsync->events.empty()) {
+                    phase = m_vsync->phase;
+                    period = m_vsync->period;
+                }
+            }
+            const bool shared_vsync = period.count() > 0 && Settings::SpeedLimit() == 100 &&
+                                      period.count() == 1'000'000'000LL / refresh_rate;
+            if (shared_vsync) {
+                core_interval = period * swap_interval;
+                // Match the event's grid, including a rebase after pause/resume.
+                if (m_next_core_vblank == std::chrono::nanoseconds{} ||
+                    (m_next_core_vblank - phase).count() % period.count() != 0 ||
+                    now > m_next_core_vblank + core_interval) {
+                    m_next_core_vblank = now < phase ? phase - period
+                                                    : phase + period * ((now - phase) / period);
+                }
+            } else if (m_next_core_vblank == std::chrono::nanoseconds{} ||
+                       now > m_next_core_vblank + core_interval) {
+                m_next_core_vblank = now;
+            }
+            if (now < m_next_core_vblank) {
+                static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
+                    kernel, m_next_core_vblank.count() + 2));
+            }
+            m_next_core_vblank += core_interval;
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now > m_next_vblank + interval) {
             // Running slower than the swap interval: show at once and don't bank the lost time.
@@ -2849,24 +2924,34 @@ private:
 
     void StartVsyncTimer() {
         if (!m_vsync_timer) {
+            static constexpr std::chrono::nanoseconds VblankInterval{1'000'000'000LL / 60};
+            const bool core_clock = PresentCoreClock();
+            std::chrono::nanoseconds first_vblank{};
+            if (core_clock) {
+                first_vblank = system.CoreTiming().GetGlobalTimeNs() + VblankInterval;
+                std::scoped_lock lk{m_vsync->mutex};
+                m_vsync->phase = first_vblank;
+                m_vsync->period = VblankInterval;
+            }
             m_vsync_timer = Core::Timing::CreateEvent(
                 "nx2:vi2 vsync",
-                [vsync_state = m_vsync, &kernel = system.Kernel()](
-                    s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                [vsync_state = m_vsync, &kernel = system.Kernel(), core_clock](
+                    s64 scheduled, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
                     std::scoped_lock lk{vsync_state->mutex};
+                    if (core_clock) {
+                        vsync_state->phase = std::chrono::nanoseconds{scheduled};
+                    }
                     for (auto* vsync : vsync_state->events) {
                         vsync->Signal(kernel);
                     }
                     return std::nullopt;
                 });
-            // EDEN_NX2_VSYNC_HZ=<rate> (experiment): the game starts frames on this event, so a
-            // frame that misses a 60 Hz tick idles until the next one.
-            static const std::chrono::nanoseconds VblankInterval{[] {
-                const char* text = std::getenv("EDEN_NX2_VSYNC_HZ");
-                const long long hz = text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 60LL;
-                return 1'000'000'000LL / hz;
-            }()};
-            system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
+            if (core_clock) {
+                system.CoreTiming().ScheduleLoopingEvent(first_vblank, VblankInterval, m_vsync_timer,
+                                                        true);
+            } else {
+                system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
+            }
         }
     }
 
@@ -2878,6 +2963,7 @@ private:
     struct VsyncState {
         std::mutex mutex;
         std::vector<Kernel::KEvent*> events;
+        std::chrono::nanoseconds phase{}, period{};
     };
     std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
@@ -3763,7 +3849,7 @@ public:
             {1111, &INx2GraphicsSystemSession::SetFeatureVersion, "SetGraphicsFrameLengthMode"},
             {1112, &INx2GraphicsSystemSession::StubReplyZeroed, "SetGraphicsFrameRestartMode"},
             {1113, &INx2GraphicsSystemSession::StubReplyZeroed, "SetGraphicsFrameGpuTimesliceMode"},
-            {1121, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1121"},
+            {1121, &INx2GraphicsSystemSession::OpenGpuTimeSession, "OpenGpuTimeSession"},
             {1203, &INx2GraphicsSystemSession::StubReplyZeroed, "DestroyChatContext"},
             {1212, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyImagePool"},
             {1501, &INx2GraphicsSystemSession::CheckPermission, "CreateInterModuleImageContext"},
@@ -3893,6 +3979,14 @@ private:
     void OpenChatSession(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 1202, returning a nx2:chat session");
         ReturnRawSession(system, ctx, std::make_shared<INx2ChatGsvSession>(system));
+    }
+
+    // nn::gs::sdk::QueryApplicationGpuTimeSpan opens its session with 1121() (handle at word 3,
+    // result at word 4). Auto-stubbed there was no handle, and the SDK's first request on it
+    // failed with 2001-0114 (invalid handle) and aborted Welcome Tour about 6 s into boot.
+    void OpenGpuTimeSession(HLERequestContext& ctx) {
+        LOG_INFO(Service, "nx2:gsv TIPC 1121, returning a nx2:gputime session");
+        ReturnRawSession(system, ctx, std::make_shared<INx2GpuTimeSession>(system));
     }
 
     void OpenSyncptSession(HLERequestContext& ctx) {

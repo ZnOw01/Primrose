@@ -83,6 +83,7 @@ public:
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
         bool reported;
+        u64 registration_position{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

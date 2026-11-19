@@ -7,7 +7,9 @@
 #pragma once
 
 #include <deque>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "common/assert.h"
@@ -133,6 +135,20 @@ protected:
         size_t new_id = slot_queries.size();
         slot_queries.emplace_back(std::forward<Args>(args)...);
         return new_id;
+    }
+
+    void BuildQueryBatch(std::span<size_t> ids) {
+        std::scoped_lock lk(guard);
+        for (size_t& query_id : ids) {
+            if (!old_queries.empty()) {
+                query_id = old_queries.front();
+                old_queries.pop_front();
+                new (&slot_queries[query_id]) QueryType();
+            } else {
+                query_id = slot_queries.size();
+                slot_queries.emplace_back();
+            }
+        }
     }
 
     void ReleaseQuery(size_t query_id) {

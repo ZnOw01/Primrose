@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -133,14 +134,27 @@ public:
     /// `effect`: what the entry may write (SplitWriteTracker; unknown unless the caller knows).
     using Effect = SplitWriteTracker::Effect;
     using WriteKind = SplitWriteTracker::WriteKind;
-    void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
-                const GPUVAddr* segment, Effect effect = Effect::Unknown) {
+    static bool WritePipeEnabled();
+    /// Up to 64 consecutive non-executable Maxwell3D registers, without a DMA segment.
+    void StateMethodRun(Tegra::Engines::EngineInterface* engine, u32 method, const u32* arguments,
+                        u32 count, Effect effect);
+    static bool AcquireKnownReleaseEnabled();
+    static bool PayloadReleaseSynchronous(bool is_fence);
+    static constexpr u64 AutoMethodKind = ~u64{0};
+    static u64 FrontMethodKind(const Tegra::Engines::EngineInterface *engine, u32 method) {
+        return static_cast<u64>(MethodKind(engine, method, false));
+    }
+    void Method(Tegra::Engines::EngineInterface *engine, u32 method, u32 argument, bool is_last,
+                const GPUVAddr *segment, Effect effect = Effect::Unknown,
+                u64 kind = AutoMethodKind) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
-        entry[0] = static_cast<u64>(Kind::Method) | (is_last ? IsLast : 0) |
-                   (segment != nullptr ? HasSegment : 0) | (u64{method & 0xffff} << 8) |
-                   (u64{argument} << 32);
+        entry[0] = (kind == AutoMethodKind
+                        ? static_cast<u64>(MethodKind(engine, method, segment != nullptr))
+                        : kind) |
+                   (is_last ? IsLast : 0) | (segment != nullptr ? HasSegment : 0) |
+                   (u64{method & 0xffff} << 8) | (u64{argument} << 32);
         if (segment != nullptr) {
             entry[1] = *segment;
         }
@@ -150,13 +164,34 @@ public:
                      u32 amount, u32 methods_pending, const GPUVAddr* segment,
                      Effect effect = Effect::Unknown);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
-    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
-                    Effect effect = Effect::Unknown) {
+    void MacroWrite(Tegra::Engines::EngineInterface *engine, u32 method, u32 argument,
+                    Effect effect = Effect::Unknown, u64 kind = AutoMethodKind) {
         SelectEngine(engine);
         u64* const entry = Reserve(1);
-        entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
-                   (u64{argument} << 32);
+        entry[0] =
+            (kind == AutoMethodKind ? static_cast<u64>(MethodKind(engine, method, false)) : kind) |
+            IsLast | Direct | (u64{method & 0xffff} << 8) | (u64{argument} << 32);
         Commit(1, effect);
+    }
+
+    /// MacroWrite for `count` (method, argument) pairs of state writes at once: the same
+    /// entries, one reservation and one commit (the effect is noted at the last one, which is
+    /// conservative). `count` is at most a JIT emit batch.
+    void MacroStateWrites(Tegra::Engines::EngineInterface *engine, const u32 *pairs, size_t count,
+                          Effect effect, u64 method_kind = AutoMethodKind) {
+        if (count == 0) {
+            return;
+        }
+        SelectEngine(engine);
+        u64* const entries = Reserve(count);
+        const u64 kind = method_kind == AutoMethodKind
+                             ? static_cast<u64>(MethodKind(engine, pairs[0], false))
+                             : method_kind;
+        for (size_t i = 0; i < count; ++i) {
+            entries[i] = static_cast<u64>(kind) | IsLast | Direct |
+                         (u64{pairs[i * 2] & 0xffff} << 8) | (u64{pairs[i * 2 + 1]} << 32);
+        }
+        Commit(count, effect);
     }
 
     /// Nx2Perf draw_begin_coalesce: Method (MacroWrite when `direct`) for an executable write
@@ -165,22 +200,33 @@ public:
     /// this function, followed by nothing, still unpublished and below 255 repeats; otherwise it
     /// is sent. With `verify` it is always sent, flagged Repeatable when it would have been
     /// counted. Returns whether it was (or would have been) counted.
-    bool RepeatableMethod(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
-                          bool is_last, bool direct, Effect effect, bool verify) {
+    bool RepeatableMethod(Tegra::Engines::EngineInterface *engine, u32 method, u32 argument,
+                          bool is_last, bool direct, Effect effect, bool verify,
+                          bool instance_pairs = false) {
         const u64 word = static_cast<u64>(Kind::Method) |
                          (direct ? IsLast | Direct : (is_last ? IsLast : 0)) |
                          (u64{method & 0xffff} << 8) | (u64{argument} << 32);
+        // A subsequent begin commutes with the intervening index count write.
+        const bool pair = instance_pairs && !verify && method == 0x586 &&
+                          repeat_end + 1 == write_position && repeat_end != 0 &&
+                          engine == front_engine && published_local < repeat_end &&
+                          IsInstanceCountWord(ring[(write_position - 1) & RingMask]);
+        const u64 position = write_position - (pair ? 2 : 1);
         // The entry at write_position - 1 is unpublished while published_local is below it.
-        const bool repeat =
-            repeat_end == write_position && engine == front_engine &&
-            published_local < write_position &&
-            (ring[(write_position - 1) & RingMask] & ~(Repeatable | RepeatMask)) == word &&
-            (ring[(write_position - 1) & RingMask] & RepeatMask) != RepeatMask;
+        const bool repeat = (repeat_end == write_position || pair) && engine == front_engine &&
+                            published_local < write_position &&
+                            (ring[position & RingMask] & ~(Repeatable | RepeatMask)) == word &&
+                            (ring[position & RingMask] & RepeatMask) != RepeatMask;
         if (repeat && !verify) {
-            ring[(write_position - 1) & RingMask] += RepeatOne;
+            ring[position & RingMask] += RepeatOne;
+            instance_pair_end = pair ? write_position : ~u64{0};
             writes.Entry(effect, write_position);
-            if (eager_publish && back_idle.load(std::memory_order_relaxed)) {
-                Publish();
+            // A repeat doesn't advance write_position: count them toward the same check.
+            if (eager_publish && ++eager_repeats >= EagerWords) {
+                eager_repeats = 0;
+                if (back_idle.load(std::memory_order_relaxed)) {
+                    Publish();
+                }
             }
             return true;
         }
@@ -192,6 +238,24 @@ public:
         Commit(1, effect);
         repeat_end = write_position;
         return flagged;
+    }
+
+    /// The count following a folded begin is idempotent, with no intervening observer.
+    bool RepeatInstanceCount(Tegra::Engines::EngineInterface *engine, u32 argument, bool is_last,
+                             bool direct, Effect effect) {
+        if (instance_pair_end != write_position || engine != front_engine ||
+            published_local >= write_position) {
+            return false;
+        }
+        instance_pair_end = ~u64{0};
+        const u64 previous = ring[(write_position - 1) & RingMask];
+        const u64 word = (direct ? IsLast | Direct : (is_last ? IsLast : 0)) | (u64{0x5f8} << 8) |
+                         (u64{argument} << 32);
+        if (!IsInstanceCountWord(previous) || (previous & ~u64{0xf}) != word) {
+            return false;
+        }
+        writes.Entry(effect, write_position);
+        return true;
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
@@ -217,7 +281,7 @@ public:
             return;
         }
         Defer(func);
-        Drain(site);
+        WaitForPending(site);
     }
 
     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
@@ -229,6 +293,8 @@ public:
     void Publish();
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
+    /// Waits for queued work and its idle hook, without borrowing the back's state afterwards.
+    void WaitForPending(DrainSite site = DrainSite::Other);
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
@@ -254,6 +320,9 @@ public:
     /// it was noted by range (not as an unknown write).
     bool NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
                    WriteKind kind = WriteKind::Other);
+    /// `synchronous`: the payload lands during the entry; its timestamp remains unknown.
+    void NoteRelease(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size, u32 value,
+                     bool synchronous);
     /// The entry just sent writes the constant buffer data `words` (`count` of them, the first
     /// `stored` land: the rest fall past the bank) at `address`. With MacroReadCbOverlay the
     /// stored words are kept by device address until the back ran the entry
@@ -276,7 +345,7 @@ public:
     /// (MacroReadWriterSet: early reads check it against proven programs, as a noted write).
     void NoteDeviceRange(u64 begin, u64 size) {
         if (size != 0) {
-            writes.Write(begin, begin + size, write_position);
+            writes.Write(begin, begin + size, write_position, WriteKind::Other);
         }
     }
     /// Waits for the queued functions (GPU memory maps among them) before the front translates
@@ -315,6 +384,9 @@ public:
     [[nodiscard]] u64 ConsumedNow() const {
         return consumed.load(std::memory_order_acquire);
     }
+    [[nodiscard]] bool MappingsSettled(u64 consumed_position) const {
+        return last_function_position <= consumed_position;
+    }
     /// Ring position the back must pass to execute possible writers of [begin, end).
     /// Deferred fence writes can still be pending afterwards.
     [[nodiscard]] u64 ReadTarget(u64 begin, u64 end) const {
@@ -333,12 +405,17 @@ private:
     friend struct GpuSplitTestAccess;
 
     enum class Kind : u64 {
-        Wrap,   ///< The rest of the ring is unused: continue at its start
-        Engine, ///< The engine the next methods go to: word 1
-        Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
-        Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
-        Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Wrap,          ///< The rest of the ring is unused: continue at its start
+        Engine,        ///< The engine the next methods go to: word 1
+        Method,        ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
+        Multi,         ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
+        Call,          ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        StateMethod,   ///< Method without a segment, known to be a fast Maxwell3D state write
+        MaxwellMethod, ///< Executable fast Maxwell3D Method without a segment or repeats
+        StateBlock,    ///< Bits 8-23 first method, 32-63 count; then packed u32 arguments
     };
+    static Kind MethodKind(const Tegra::Engines::EngineInterface* engine, u32 method,
+                           bool has_segment);
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
@@ -377,11 +454,22 @@ private:
         // EagerPublish: while the back has nothing to do, every entry goes out at once instead of
         // waiting for the next 256-word batch (the back idled while the front filled it, then the
         // front waited for the back to catch up).
-        if (write_position - published_local >= publish_every ||
-            (eager_publish && back_idle.load(std::memory_order_relaxed))) {
+        // The idle flag lives on a line the back keeps writing: reading it for every entry cost
+        // ~0.6 ms a frame (Welcome Tour, ~150k entries), so look once EagerWords are pending.
+        const u64 pending = write_position - published_local;
+        if (pending >= publish_every ||
+            (eager_publish && pending >= EagerWords &&
+             back_idle.load(std::memory_order_relaxed))) {
             Publish();
         }
     }
+    static bool IsInstanceCountWord(u64 word) {
+        const auto kind = static_cast<Kind>(word & 0xf);
+        return (kind == Kind::Method || kind == Kind::MaxwellMethod) &&
+               ((word >> 8) & 0xffff) == 0x5f8 &&
+               (word & (HasSegment | Repeatable | RepeatMask)) == 0;
+    }
+    static void CheckLayout();
     void WaitForSpace(size_t words);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
@@ -406,6 +494,7 @@ private:
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
+    size_t ExecuteImpl(const u64* entry, size_t words);
     /// A Method entry with a repeat count (RepeatableMethod): the call, then the repeats.
     void ExecuteRepeated(u64 head);
     /// EDEN_NX2_PERF_VERIFY with draw_begin_coalesce: checks that a Repeatable entry directly
@@ -415,13 +504,16 @@ private:
     Core::System* system{};
     bool active{};
     bool eager_publish{}; ///< Nx2Perf::Opt::EagerPublish, read once at Start
+    /// EagerPublish looks at back_idle once this many words are unpublished (or repeats counted).
+    static constexpr u64 EagerWords = 16;
     /// Nx2Perf::Verify() with draw_begin_coalesce, read once at Start before the back starts
     bool verify_repeats{};
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
     // Front side.
-    u64 write_position{};
+    alignas(128) u64 write_position{};
+    u32 eager_repeats{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 last_function_position{};
@@ -445,12 +537,13 @@ private:
     u64 consumed_cache{};
     /// RepeatableMethod: the ring position after the last entry it sent
     u64 repeat_end{~u64{0}};
+    u64 instance_pair_end{~u64{0}};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
 
     // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    alignas(128) Tegra::Engines::EngineInterface *back_engine{};
     /// VerifyRepeat: the last entry's word, the Repeatable entries seen and those that did not
     /// follow the same word, since the last report
     u64 verify_previous{};
@@ -468,10 +561,10 @@ private:
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
     static inline thread_local bool on_gpu_thread{};
-    void (*idle_hook)(void*){};
+    alignas(128) void (*idle_hook)(void *){};
     void* idle_argument{};
-    alignas(64) std::atomic<bool> hook_requested{};
-    std::atomic<bool> back_running{};
+    alignas(128) std::atomic<bool> hook_requested{};
+    alignas(128) std::atomic<bool> back_running{};
     std::atomic<bool> back_quiet{true};
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
@@ -485,7 +578,7 @@ private:
     [[nodiscard]] static size_t AsyncWriteBucket(u64 slot) {
         return static_cast<size_t>((slot ^ (slot >> 16) ^ (slot >> 32)) & (AsyncWriteBuckets - 1));
     }
-    std::vector<u64> async_writes = std::vector<u64>(AsyncWriteBuckets);
+    alignas(128) std::vector<u64> async_writes = std::vector<u64>(AsyncWriteBuckets);
     bool any_async_write{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
@@ -497,5 +590,33 @@ private:
     std::atomic<u32> front_wake{};
     std::jthread back_thread;
 };
+
+// offsetof on this non-standard-layout owner is supported by MSVC, Clang and GCC.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+// Layout only: no runtime switch or synchronization changes.
+inline void GpuSplit::CheckLayout() {
+    static_assert(offsetof(GpuSplit, write_position) % 128 == 0);
+    static_assert(offsetof(GpuSplit, write_position) >= offsetof(GpuSplit, ring) + sizeof(ring));
+    static_assert(offsetof(GpuSplit, back_engine) % 128 == 0);
+    static_assert(offsetof(GpuSplit, front_engine) / 128 < offsetof(GpuSplit, back_engine) / 128);
+    static_assert(offsetof(GpuSplit, idle_hook) / 128 > offsetof(GpuSplit, verify_report_ns) / 128);
+    static_assert(offsetof(GpuSplit, hook_requested) / 128 >
+                  offsetof(GpuSplit, idle_argument) / 128);
+    static_assert(offsetof(GpuSplit, back_running) / 128 >
+                  offsetof(GpuSplit, hook_requested) / 128);
+    static_assert(offsetof(GpuSplit, published) % 128 == 0);
+    static_assert(offsetof(GpuSplit, consumed) >= offsetof(GpuSplit, published) + 128);
+    static_assert(offsetof(GpuSplit, async_writes) >= offsetof(GpuSplit, consumed) + 128);
+    static_assert(offsetof(GpuSplit, wait_target) % 128 == 0);
+    static_assert(offsetof(GpuSplit, back_waiting) >= offsetof(GpuSplit, wait_target) + 128);
+    static_assert(offsetof(GpuSplit, front_waiting) >= offsetof(GpuSplit, back_waiting) + 128);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 } // namespace VideoCommon

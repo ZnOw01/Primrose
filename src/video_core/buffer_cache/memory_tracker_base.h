@@ -133,6 +133,10 @@ public:
     /// Mark region as modified from the CPU
     /// but don't mark it as modified until FlusHCachedWrites is called.
     void CachedCpuWrite(VAddr dirty_cpu_addr, u64 query_size) {
+        static constexpr bool reuse_clean = true;
+        if (reuse_clean) {
+            ++cpu_epoch;
+        }
         IteratePages<true>(dirty_cpu_addr, query_size, [this](Manager* manager, u64 offset, size_t size) {
             const VAddr cpu_address = manager->cpu_addr + offset;
             manager->ChangeRegionState(Type::CachedCPU, true, cpu_address, size);
@@ -158,9 +162,11 @@ public:
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     template <typename Func>
-    void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
-            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func);
+    void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func,
+                            bool* upload_clean = nullptr) {
+        IteratePages<true>(query_cpu_range, query_size, [&func, upload_clean](Manager* manager, u64 offset, size_t size) {
+            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func,
+                                          upload_clean);
         });
     }
 
@@ -192,8 +198,9 @@ public:
     /// ForEachUploadRange without the clean words (word_manager.h) at either end of each manager's
     /// part of the range: they have nothing to find or change. A per-word form of PR #161's skip.
     template <typename Func>
-    void ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+    void ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func,
+                                 bool* upload_clean = nullptr) {
+        IteratePages<true>(query_cpu_range, query_size, [&func, upload_clean](Manager* manager, u64 offset, size_t size) {
             const u64 dirty =
                 manager->DirtyWords(offset / BYTES_PER_WORD, (offset + size - 1) / BYTES_PER_WORD);
             if (dirty == 0) {
@@ -203,9 +210,20 @@ public:
             const u64 end =
                 (std::min<u64>)(offset + size, (64 - std::countl_zero(dirty)) * BYTES_PER_WORD);
             manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + begin,
-                                          static_cast<s64>(end - begin), func);
+                                          static_cast<s64>(end - begin), func, upload_clean);
         });
     }
+    /// Requires the range to be protected and CPU-clean, including at partially covered words.
+    [[nodiscard]] bool IsRegionUploadClean(VAddr query_cpu_addr, u64 query_size) {
+        return !IteratePages<true>(query_cpu_addr, query_size,
+                                  [](Manager* manager, u64 offset, size_t size) {
+            return manager->DirtyWords(offset / BYTES_PER_WORD,
+                                       (offset + size - 1) / BYTES_PER_WORD) != 0 &&
+                   (manager->IsRegionModified(Type::CPU, offset, size) ||
+                    manager->IsRegionModified(Type::Untracked, offset, size));
+        });
+    }
+
     /// Verify mode: true when the clean words of the managers over a range match a recount.
     [[nodiscard]] bool CleanWordsHold(VAddr query_cpu_addr, u64 query_size) const noexcept {
         const size_t first = query_cpu_addr >> HIGHER_PAGE_BITS;

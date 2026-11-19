@@ -27,11 +27,16 @@ class System;
 
 namespace ConfigurationShared {
 class Builder;
+class Widget;
 }
 
 namespace Performance {
 
 enum class Platform { Nvidia, Amd, Intel, MacOs };
+
+/// The primary graphics device (the vulkan_device setting), null if unknown.
+[[nodiscard]] const VkDeviceInfo::Record* PrimaryDevice(
+    const std::vector<VkDeviceInfo::Record>& records);
 
 /// Which launch arguments (EDEN_NX2_NAME=VALUE) are switched on. The four platform tabs share it,
 /// since the same argument can be recommended on more than one. They are kept in a block of the
@@ -107,6 +112,7 @@ class ConfigureShaders : public ConfigurationShared::Tab {
 public:
     explicit ConfigureShaders(const Core::System& system_,
                               const ConfigurationShared::Builder& builder,
+                              const std::vector<VkDeviceInfo::Record>& records,
                               QWidget* parent = nullptr);
     ~ConfigureShaders() override;
 
@@ -115,6 +121,12 @@ public:
 
     /// Settings the global configuration shows here rather than on the graphics tabs.
     static bool IsShaderSetting(u32 id);
+
+    /// The mesh_shader_mode dropdown: notes Auto's choice on an AMD driver, and on a device
+    /// without VK_EXT_mesh_shader shows the compute fallback, disabled, keeping the stored value.
+    static void SetUpMeshShaderMode(ConfigurationShared::Widget* widget,
+                                    const std::vector<VkDeviceInfo::Record>& records,
+                                    std::vector<std::function<void(bool)>>& apply_funcs);
 
 private:
     const Core::System& system;

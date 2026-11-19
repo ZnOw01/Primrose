@@ -223,6 +223,7 @@ private:
         struct Run {
             GPUVAddr begin;
             GPUVAddr end;
+            DAddr device_addr;
         };
         std::vector<Run> runs;
         std::vector<std::pair<s64, PTEKind>> kinds;

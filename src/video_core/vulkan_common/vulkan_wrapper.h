@@ -161,7 +161,6 @@ inline constexpr VkPipelineStageFlags PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER_H
 
 inline constexpr VkPipelineStageFlags PIPELINE_STAGE_HOST = VK_PIPELINE_STAGE_HOST_BIT;
 
-
 /// Table holding Vulkan instance function pointers.
 struct InstanceDispatch {
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr{};
@@ -249,6 +248,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdPushConstants vkCmdPushConstants{};
     PFN_vkCmdPushDescriptorSetWithTemplateKHR vkCmdPushDescriptorSetWithTemplateKHR{};
     PFN_vkCmdResetQueryPool vkCmdResetQueryPool{};
+    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
     PFN_vkCmdResolveImage vkCmdResolveImage{};
     PFN_vkCmdSetBlendConstants vkCmdSetBlendConstants{};
     PFN_vkCmdSetCullModeEXT vkCmdSetCullModeEXT{};
@@ -1285,6 +1285,11 @@ public:
 
     void ResetQueryPool(VkQueryPool query_pool, u32 first, u32 count) const noexcept {
         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
+    }
+
+    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
+                        u32 query) const noexcept {
+        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
     }
 
     void BindDescriptorSets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 first,

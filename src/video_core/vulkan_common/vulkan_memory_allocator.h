@@ -111,7 +111,8 @@ namespace Vulkan {
 
         /// `dedicated`: own device memory, returned to the driver on destruction (short-lived
         /// images would otherwise leave holes in the shared blocks).
-        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                              bool transient = false) const;
 
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
@@ -155,6 +156,10 @@ namespace Vulkan {
         MemoryCommit Commit(const vk::Buffer &buffer, MemoryUsage usage);
 
     private:
+        bool CreateImageInSeparatePool(const VkImageCreateInfo& ci,
+                                       const VmaAllocationCreateInfo& alloc_ci, VkImage& handle,
+                                       VmaAllocation& allocation, VmaAllocationInfo& info) const;
+
         static bool IsAutoUsage(VmaMemoryUsage u) noexcept {
             switch (u) {
                 case VMA_MEMORY_USAGE_AUTO:

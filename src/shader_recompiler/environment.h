@@ -72,6 +72,12 @@ struct ConstBufferAddr {
     u32 count;
     bool has_secondary;
     u32 handle_program{~0U}; ///< index in Info::handle_programs for a handle computed per draw
+    /// Set when the dynamic offset is FindUMsb32(mask) * element_stride (+ a constant): the shader
+    /// iterates the set bits of a mask, so it reaches only element_offset + i * element_stride
+    /// for i = element_index in [0, 32). Sampled textures then get a 32-element array.
+    IR::U32 element_index{};
+    u32 element_offset{};
+    u32 element_stride{};
 };
 
 class Environment {

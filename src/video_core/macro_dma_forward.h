@@ -11,6 +11,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -18,6 +19,9 @@
 
 #include "common/common_types.h"
 #include "video_core/macro_turing.h"
+#ifdef ARCHITECTURE_x86_64
+#include "video_core/macro_turing_jit.h"
+#endif
 
 // Nx2Perf dma_forward: can a native (Turing) macro call run on the split front without the words
 // its MME_DMA_READ_FIFOED reads? Analyze dry-runs the call with placeholder words and tracks
@@ -474,28 +478,61 @@ bool Recompute(const Snapshot& snapshot, std::span<const u32> words, u32 macro_r
     interpreter->active_dram = &interpreter->dram;
     fifo.assign(snapshot.parameters.begin(),
                 snapshot.parameters.begin() + snapshot.num_parameters);
-    u32 index{};
-    const auto result = interpreter->Execute(
-        std::span<const u32>{snapshot.code.data(), snapshot.num_code_words}, snapshot.start, fifo,
-        [&snapshot](u32 address) {
-            for (u32 i = 0; i < snapshot.num_state_reads; ++i) {
-                if (snapshot.state_reads[i].first == address) {
-                    return snapshot.state_reads[i].second;
-                }
+    u32 index_writes{};
+    const auto read = [&snapshot](u32 address) {
+        for (u32 i = 0; i < snapshot.num_state_reads; ++i) {
+            if (snapshot.state_reads[i].first == address) {
+                return snapshot.state_reads[i].second;
             }
-            return 0U;
-        },
-        [&](u32 method, u32 value) {
-            if (method == 0x158) {
-                fifo.insert(fifo.end(), words.begin(),
-                            words.begin() + (std::min<size_t>)(value, words.size()));
+        }
+        return 0U;
+    };
+    const auto emit = [&](u32 method, u32 value) {
+        if (method == 0x158) {
+            fifo.insert(fifo.end(), words.begin(),
+                        words.begin() + (std::min<size_t>)(value, words.size()));
+        }
+        if (index_writes++ >= snapshot.first_forwarded) {
+            apply(method, value);
+        }
+        return method < macro_registers_start;
+    };
+    const auto code = std::span<const u32>{snapshot.code.data(), snapshot.num_code_words};
+#ifdef ARCHITECTURE_x86_64
+    static constexpr bool compile_forward = true;
+    if (compile_forward) {
+        struct Compiled {
+            std::vector<u32> code;
+            std::unique_ptr<Tegra::TuringMacroJit> jit;
+        };
+        static thread_local std::array<Compiled, 8> programs;
+        static thread_local size_t last_program{};
+        const auto matches = [&](const Compiled& program) {
+            return program.jit && std::ranges::equal(program.code, code);
+        };
+        size_t index = last_program;
+        if (!matches(programs[index])) {
+            index = 0;
+            while (index < programs.size() && programs[index].jit && !matches(programs[index])) {
+                ++index;
             }
-            if (index++ >= snapshot.first_forwarded) {
-                apply(method, value);
+        }
+        if (index < programs.size()) {
+            auto& program = programs[index];
+            if (!program.jit) {
+                program.code.assign(code.begin(), code.end());
+                program.jit = std::make_unique<Tegra::TuringMacroJit>();
+                program.jit->Prepare(program.code, 0);
             }
-            return method < macro_registers_start;
-        });
-    return result.success && index == snapshot.num_writes;
+            last_program = index;
+            const auto result = program.jit->Execute(snapshot.start, fifo,
+                                                     std::span<u32>{interpreter->dram}, read, emit);
+            return result.success && index_writes == snapshot.num_writes;
+        }
+    }
+#endif
+    const auto result = interpreter->Execute(code, snapshot.start, fifo, read, emit);
+    return result.success && index_writes == snapshot.num_writes;
 }
 
 } // namespace VideoCommon::DmaForward

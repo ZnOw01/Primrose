@@ -283,6 +283,8 @@ private:
     QueryCacheRuntime query_cache_runtime;
     QueryCache query_cache;
     PipelineCache pipeline_cache;
+    Tegra::Nx2DrawPrograms last_non_writer_programs{};
+    u64 last_non_writer_epoch{};
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
     FrameDump frame_dump;

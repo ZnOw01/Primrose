@@ -250,7 +250,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                    via_header_index);
             }
             ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
-            const u32 index_offset{index << desc.size_shift};
+            const u32 index_offset{Shader::DescriptorElementOffset(desc, index)};
             const u32 offset{desc.cbuf_offset + index_offset};
             const GPUVAddr addr{cbufs[desc.cbuf_index].Address() + offset};
             if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||

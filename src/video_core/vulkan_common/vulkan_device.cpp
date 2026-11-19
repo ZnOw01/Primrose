@@ -795,7 +795,6 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
-
     VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
@@ -869,9 +868,10 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::TransientImages ? TransientImageBlockSize
+                                                               : SeparatePoolBlockSize,
             .minBlockCount = 0,
-            .maxBlockCount = 0,
+            .maxBlockCount = kind == SeparatePool::TransientImages ? size_t{2} : size_t{0},
             .priority = 0.f,
             .minAllocationAlignment = 0,
             .pMemoryAllocateNext = nullptr,
@@ -1624,15 +1624,24 @@ void Device::RemoveUnsuitableExtensions() {
     features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
     features.mesh_shader.meshShaderQueries = VK_FALSE;
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
-    // The use_mesh_shaders setting or EDEN_NX2_FORCE_MESH_FALLBACK=1: leave VK_EXT_mesh_shader
-    // disabled, so task/mesh draws take the compute fallback a device without it uses.
-    if (extensions.mesh_shader && !Settings::values.use_mesh_shaders.GetValue()) {
-        LOG_INFO(Render_Vulkan, "Mesh shaders turned off in the settings: VK_EXT_mesh_shader "
-                                "disabled");
+    // The mesh_shader_mode setting: leave VK_EXT_mesh_shader disabled for the compute fallback a
+    // device without it uses. AMD runs task shaders on a compute queue ganged with the graphics
+    // queue. With the guest's task programs that hangs the GPU (RDNA2 on RADV 26.2: gfx ring
+    // timeout, device lost), while the compute fallback runs the same draws fine, so Auto takes
+    // the fallback there. NVIDIA and Intel have task and mesh stages in the graphics pipe.
+    const VkDriverId mesh_driver{properties.driver.driverID};
+    const bool amd_task_on_compute_queue{mesh_driver == VK_DRIVER_ID_MESA_RADV ||
+                                         mesh_driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                         mesh_driver == VK_DRIVER_ID_AMD_OPEN_SOURCE};
+    const Settings::MeshShaderMode mesh_mode{Settings::values.mesh_shader_mode.GetValue()};
+    if (extensions.mesh_shader && mesh_mode == Settings::MeshShaderMode::ComputeFallback) {
+        LOG_INFO(Render_Vulkan, "Task/mesh shaders set to the compute fallback: "
+                                "VK_EXT_mesh_shader disabled");
         extensions.mesh_shader = false;
-    }
-    if (extensions.mesh_shader && std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK") != nullptr) {
-        LOG_WARNING(Render_Vulkan, "EDEN_NX2_FORCE_MESH_FALLBACK: VK_EXT_mesh_shader disabled");
+    } else if (extensions.mesh_shader && mesh_mode == Settings::MeshShaderMode::Auto &&
+               amd_task_on_compute_queue) {
+        LOG_INFO(Render_Vulkan, "AMD driver: VK_EXT_mesh_shader disabled, task/mesh draws use the "
+                                "compute fallback (set task/mesh shaders to keep it)");
         extensions.mesh_shader = false;
     }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,

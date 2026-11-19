@@ -327,7 +327,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                    via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
-            const u32 index_offset{index << desc.size_shift};
+            const u32 index_offset{Shader::DescriptorElementOffset(desc, index)};
             const u32 offset{desc.cbuf_offset + index_offset};
             const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
             if constexpr (std::is_same_v<decltype(desc), const TextureDescriptor&> ||

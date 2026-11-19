@@ -167,6 +167,7 @@ ENUM(GameListMode, TreeView, GridView, CarouselView);
 ENUM(SpeedMode, Standard, Turbo, Slow);
 ENUM(FrameGenType, Lsfg, Fsr3);
 ENUM(ColdHintMode, Off, WhenRamIsLow, Always);
+ENUM(MeshShaderMode, Auto, Native, ComputeFallback);
 ENUM(UpdateChannel, Unset, Stable, ReleaseCandidate, Daily);
 
 template <typename Type>

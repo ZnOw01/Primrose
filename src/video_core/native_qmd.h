@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <span>
 #include <string_view>
@@ -68,16 +69,21 @@ public:
         if (!nx2_perf || VideoCommon::Nx2Perf::Verify()) pending = {};
         std::size_t count = 1;
         pending[0] = {address, argument & 15, ((argument >> 14) & 0x3ff) + 1};
+        static constexpr bool cache_states = true;
         for (std::size_t i = 0; i < count; ++i) {
             const auto request = pending[i];
-            if (states.size() >= 4096 && !states.contains(request.address)) {
+            auto& cached = state_cache[(request.address >> 8) % state_cache.size()];
+            State* found = cache_states && cached.address == request.address ? cached.state : nullptr;
+            if (!found && states.size() >= 4096 && !states.contains(request.address)) {
                 // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
+                if (cache_states) state_cache.fill({});
                 std::erase_if(states, [](const auto& entry) {
                     return entry.second.completed && entry.second.deferred == 0;
                 });
                 if (states.size() >= 4096) return "QMD cache limit";
             }
-            auto& state = states[request.address];
+            auto& state = found ? *found : states[request.address];
+            if (cache_states && !found) cached = {request.address, &state};
             bool just_loaded = false;
             if (request.action == 3 || request.action == 2) {
                 if (request.action == 3 || !state.loaded) {
@@ -164,5 +170,12 @@ private:
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
     // arrived first was kept by the other channel's scheduler and the QMD never launched).
     static inline std::unordered_map<Address, State> states;
+    // No default member initializers: clang rejects using them (fill({})) inside the class.
+    // Value-initialization ({}) zeroes both members.
+    struct CachedState {
+        Address address;
+        State* state;
+    };
+    static inline std::array<CachedState, 64> state_cache{};
 };
 } // namespace Tegra

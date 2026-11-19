@@ -70,6 +70,11 @@ public:
     void ProcessData(u32 data, bool is_last_call);
     void ProcessData(const u32* data, size_t num_data);
 
+    bool CanBatchLinearData(size_t words) const {
+        return native_partial && is_linear && regs.line_count == 1 &&
+               write_offset <= copy_size && words <= (copy_size - write_offset) / sizeof(u32);
+    }
+
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 

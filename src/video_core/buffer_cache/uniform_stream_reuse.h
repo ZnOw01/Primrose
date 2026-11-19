@@ -15,6 +15,7 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/buffer_cache/buffer_bytes_equal.h"
 #include "video_core/nx2_draw_stats.h"
 
 namespace VideoCommon {
@@ -44,6 +45,11 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
     return enabled;
 }
 
+[[nodiscard]] inline bool AdaptiveUniformStreamEnabled() noexcept {
+    static constexpr bool enabled = true;
+    return enabled;
+}
+
 template <class Ref>
 class UniformStreamReuse {
 public:
@@ -55,6 +61,8 @@ public:
         Ref ref{};
         u64 tick{};
         u32 size{}; // 0: nothing streamed yet
+        u32 misses{};
+        u32 cooldown{};
         std::array<u8, MaxBytes> bytes{};
     };
 
@@ -63,6 +71,8 @@ public:
             for (Slot& slot : stage) {
                 slot.size = 0;
                 slot.tick = 0;
+                slot.misses = 0;
+                slot.cooldown = 0;
             }
         }
         for (Slot& slot : compute_slots) {
@@ -106,11 +116,29 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
+    const bool adaptive = AdaptiveUniformStreamEnabled();
+    if (adaptive && slot.cooldown != 0) {
+        --slot.cooldown;
+        const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+        device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+        return true;
+    }
     u8* const scratch = reuse.scratch.data();
-    device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+    const u8* source = nullptr;
+    static constexpr bool direct_compare = true;
+    if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
+        if (direct_compare) {
+            source = device_memory.GetSpan(device_addr, size);
+        }
+    }
+    const bool direct = source != nullptr;
+    if (!direct) {
+        device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+        source = scratch;
+    }
 
     const bool same_bytes =
-        slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
+        slot.size == size && BufferBytesEqual(slot.bytes.data(), source, size);
     const bool same_tick = same_bytes && slot.tick == runtime.CurrentTick();
     if (VideoCommon::Nx2DrawStats::Enabled()) [[unlikely]] {
         // EDEN_NX2_BIND_STATS: binds through the reuse, how many were reused, and how many had
@@ -123,15 +151,32 @@ template <class Runtime, class DeviceMemory>
         }
     }
     if (same_tick) {
+        slot.misses = 0;
         runtime.RebindStreamUniform(slot.ref, size);
         return true;
     }
+    // Two failed probes: stream once per bind, then try reuse again after 32 binds.
+    if (adaptive && !same_bytes && ++slot.misses == 2) {
+        slot.misses = 0;
+        slot.cooldown = 32;
+        slot.size = 0;
+        const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+        std::memcpy(span.data(), source, size);
+        return true;
+    }
+    if (same_bytes) {
+        slot.misses = 0;
+    }
+    if (direct && !same_bytes) {
+        slot.size = size;
+        std::memcpy(slot.bytes.data(), source, size);
+    }
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-    std::memcpy(span.data(), scratch, size);
+    std::memcpy(span.data(), direct ? slot.bytes.data() : scratch, size);
     slot.ref = runtime.LastStreamUniformRef();
     // After the allocation: the tick the stream region is tagged with is the one current now.
     slot.tick = runtime.CurrentTick();
-    if (!same_bytes) {
+    if (!direct && !same_bytes) {
         slot.size = size;
         std::memcpy(slot.bytes.data(), scratch, size);
     }

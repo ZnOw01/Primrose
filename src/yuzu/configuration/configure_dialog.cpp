@@ -68,7 +68,8 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
       performance_state{std::make_unique<Performance::State>()},
       performance_gpu_tab{
           std::make_unique<ConfigureGpu>(*performance_state, vk_device_records, this)},
-      performance_shaders_tab{std::make_unique<ConfigureShaders>(system_, *builder, this)},
+      performance_shaders_tab{
+          std::make_unique<ConfigureShaders>(system_, *builder, vk_device_records, this)},
       performance_ram_tab{std::make_unique<ConfigureRam>(system_, *builder, this)},
       profile_tab{std::make_unique<ConfigureProfileManager>(system_, this)},
       system_tab{std::make_unique<ConfigureSystem>(system_, nullptr, *builder, this)},

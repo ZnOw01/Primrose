@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -21,6 +22,8 @@
 #include "common/bit_field.h"
 #include "common/common_types.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/gpu_split.h"
+#include "video_core/nx2_gpu_side.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/query_cache/query_base.h"
 #include "video_core/query_cache/types.h"
@@ -85,6 +88,17 @@ public:
         return result;
     }
 
+    /// Vulkan may publish a copied result without waiting for unrelated fence callbacks.
+    bool TryFlushHostQueryRegion(VAddr addr, std::size_t size);
+
+    static bool HostQueryReadbackEnabled() {
+        if constexpr (requires { Traits::HAS_HOST_QUERY_READBACK; }) {
+            return Traits::HAS_HOST_QUERY_READBACK &&
+                   Nx2GpuSide::On(Nx2GpuSide::Opt::QueryReadback);
+        }
+        return false;
+    }
+
     static u64 BuildMask(std::span<const QueryType> types) {
         u64 mask = 0;
         for (auto query_type : types) {
@@ -138,6 +152,10 @@ protected:
         static constexpr bool RETURNS_BOOL =
             std::is_same_v<std::invoke_result<Func, QueryLocation>, bool>;
         if (size == 0) {
+            return;
+        }
+        static constexpr bool filter_pages = true;
+        if (filter_pages && GpuSplit::OnBackThread() && !page_filter.Any(addr, size)) {
             return;
         }
         const u64 addr_begin = addr;

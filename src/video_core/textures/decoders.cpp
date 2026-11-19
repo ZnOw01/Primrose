@@ -202,10 +202,7 @@ void SwizzleSubrectImpl(std::span<u8> output, std::span<const u8> input, u32 wid
 template <bool TO_LINEAR>
 void Swizzle(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
              u32 height, u32 depth, u32 block_height, u32 block_depth, u32 stride_alignment, bool native_tiling) {
-    static const bool native_masks = [] {
-        const char* value = std::getenv("EDEN_NX2_NATIVE_SWIZZLE_MASKS");
-        return value != nullptr && value[0] == '1';
-    }();
+    static constexpr bool native_masks = true;
     switch (bytes_per_pixel) {
 #define BPP_CASE(x)                                                                                \
     case x:                                                                                        \

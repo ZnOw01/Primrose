@@ -268,6 +268,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     }
     DAddr cpu_addr = *cpu_addr_opt;
     u8* const pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
+    if constexpr (requires { impl->runtime.InvalidateHostQuery(cpu_addr); }) {
+        impl->runtime.InvalidateHostQuery(cpu_addr);
+    }
     if (!is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
         if (has_timestamp) {
             const u64 timestamp = impl->gpu.GetTicks();
@@ -310,6 +313,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                                                      std::memory_order_release);
             }
         } const settle{settle_slot};
+        std::unique_lock result_lock{cache_mutex, std::defer_lock};
+        if (HostQueryReadbackEnabled()) {
+            result_lock.lock();
+        }
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
@@ -328,18 +335,26 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         query_base->value += op_streamer->GetAmendValue();
         op_streamer->SetAccumulationValue(query_base->value);
         const DAddr query_cpu_addr = query_base->guest_address;
+        const bool write_result = !HostQueryReadbackEnabled() ||
+            False(query_base->flags &
+                  (QueryFlagBits::IsHostReadPublished | QueryFlagBits::IsRewritten));
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             const u64 timestamp = impl->gpu.GetTicks();
             u8* const pointer_timestamp =
                 impl->device_memory.template GetPointer<u8>(query_cpu_addr + 8);
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-            std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
-        } else {
+            if (write_result) {
+                std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
+            }
+        } else if (write_result) {
             const u32 value = static_cast<u32>(query_base->value);
             std::memcpy(pointer, &value, sizeof(value));
         }
-        Tegra::Nx2SemaphoreWaiters::Get().OnWrite(query_cpu_addr,
-                                                  static_cast<u32>(query_base->value));
+        if (!HostQueryReadbackEnabled() ||
+            False(query_base->flags & QueryFlagBits::IsRewritten)) {
+            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(query_cpu_addr,
+                                                      static_cast<u32>(query_base->value));
+        }
         if (!is_synced) [[likely]] {
             impl->pending_unregister.push_back(query_location);
         }
@@ -363,14 +378,24 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         auto it1 = cached_queries.try_emplace(cont_addr);
         page_filter.Mark(cpu_addr, 16);
         auto& sub_container = it1.first->second;
-        auto it_current = sub_container.find(base);
-        if (it_current == sub_container.end()) {
+        static constexpr bool one_probe = true;
+        if (one_probe) {
+            auto [it_current, inserted] = sub_container.try_emplace(base, query_location);
+            if (!inserted) {
+                auto* old_query = impl->ObtainQuery(it_current->second);
+                old_query->flags |= QueryFlagBits::IsRewritten;
+                it_current->second = query_location;
+            }
+        } else {
+            auto it_current = sub_container.find(base);
+            if (it_current == sub_container.end()) {
+                sub_container.insert_or_assign(base, query_location);
+                return;
+            }
+            auto* old_query = impl->ObtainQuery(it_current->second);
+            old_query->flags |= QueryFlagBits::IsRewritten;
             sub_container.insert_or_assign(base, query_location);
-            return;
         }
-        auto* old_query = impl->ObtainQuery(it_current->second);
-        old_query->flags |= QueryFlagBits::IsRewritten;
-        sub_container.insert_or_assign(base, query_location);
     }
 }
 
@@ -575,6 +600,10 @@ bool QueryCacheBase<Traits>::ShouldWaitAsyncFlushes() {
 
 template <typename Traits>
 void QueryCacheBase<Traits>::PopAsyncFlushes() {
+    std::unique_lock result_lock{cache_mutex, std::defer_lock};
+    if (HostQueryReadbackEnabled()) {
+        result_lock.lock();
+    }
     u64 mask;
     {
         std::scoped_lock lk(impl->flush_guard);
@@ -626,6 +655,10 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
     if (!query_base) {
         return false;
     }
+    if (HostQueryReadbackEnabled() &&
+        True(query_base->flags & QueryFlagBits::IsHostReadPublished)) {
+        return true;
+    }
     if (True(query_base->flags & QueryFlagBits::IsFinalValueSynced) &&
         False(query_base->flags & QueryFlagBits::IsGuestSynced)) {
         auto* ptr = impl->device_memory.template GetPointer<u8>(query_base->guest_address);
@@ -639,6 +672,98 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
     }
     return True(query_base->flags & QueryFlagBits::IsHostManaged) &&
            False(query_base->flags & QueryFlagBits::IsGuestSynced);
+}
+
+template <typename Traits>
+bool QueryCacheBase<Traits>::TryFlushHostQueryRegion(VAddr addr, std::size_t size) {
+    if constexpr (requires { impl->runtime.TryReadHostQuery(DAddr{}, std::span<u8>{}); }) {
+        if (!HostQueryReadbackEnabled() || size == 0 || !IsRegionGpuModified(addr, size)) {
+            return false;
+        }
+        bool needs_sync = false;
+        const auto publish = [&] {
+            if constexpr (requires { impl->runtime.HostQueryWaitTick(DAddr{}); }) {
+                if (impl->runtime.MergeHostQueryWaits()) {
+                    bool ready = true;
+                    u64 tick = 0;
+                    IterateCache<false>(addr, size, [&](QueryLocation location) {
+                        auto* query = impl->ObtainQuery(location);
+                        if (!query) {
+                            ready = false;
+                            return;
+                        }
+                        const size_t value_size =
+                            True(query->flags & QueryFlagBits::HasTimestamp) ? 8 : 4;
+                        if (location.stream_id.Value() !=
+                                static_cast<u32>(QueryType::ZPassPixelCount64) ||
+                            True(query->flags &
+                                 (QueryFlagBits::IsInvalidated | QueryFlagBits::IsRewritten)) ||
+                            (True(query->flags & QueryFlagBits::HasTimestamp) &&
+                             addr + size > query->guest_address + value_size)) {
+                            ready = false;
+                            return;
+                        }
+                        if (False(query->flags & QueryFlagBits::IsHostSynced)) {
+                            needs_sync = true;
+                            ready = false;
+                            return;
+                        }
+                        const auto query_tick =
+                            impl->runtime.HostQueryWaitTick(query->guest_address);
+                        if (query_tick) {
+                            tick = (std::max)(tick, *query_tick);
+                        } else {
+                            ready = false;
+                        }
+                    });
+                    if (!ready) {
+                        return false;
+                    }
+                    impl->runtime.WaitHostQueryTick(tick);
+                }
+            }
+            bool found = false;
+            bool complete = true;
+            IterateCache<false>(addr, size, [&](QueryLocation location) {
+                found = true;
+                auto* query = impl->ObtainQuery(location);
+                if (!query) {
+                    complete = false;
+                    return;
+                }
+                const size_t value_size = True(query->flags & QueryFlagBits::HasTimestamp) ? 8 : 4;
+                if (location.stream_id.Value() != static_cast<u32>(QueryType::ZPassPixelCount64) ||
+                    True(query->flags & (QueryFlagBits::IsInvalidated | QueryFlagBits::IsRewritten)) ||
+                    (True(query->flags & QueryFlagBits::HasTimestamp) &&
+                     addr + size > query->guest_address + value_size)) {
+                    complete = false;
+                    return;
+                }
+                if (False(query->flags & QueryFlagBits::IsHostSynced)) {
+                    needs_sync = true;
+                    complete = false;
+                    return;
+                }
+                auto* pointer = impl->device_memory.template GetPointer<u8>(query->guest_address);
+                if (!impl->runtime.TryReadHostQuery(query->guest_address,
+                                                   std::span<u8>{pointer, value_size})) {
+                    complete = false;
+                    return;
+                }
+                query->flags |= QueryFlagBits::IsHostReadPublished;
+            });
+            return found && complete;
+        };
+        if (publish()) {
+            return true;
+        }
+        if (needs_sync) {
+            NotifyWFI();
+            return publish();
+        }
+        return false;
+    }
+    return false;
 }
 
 template <typename Traits>

@@ -50,6 +50,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/page_filter.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -464,6 +465,7 @@ public:
     /// Commit asynchronous downloads
     void CommitAsyncFlushes();
     void CommitAsyncFlushesHigh();
+    bool CommitAsyncFlushesIfNeeded();
 
     /// Pop asynchronous downloads
     void PopAsyncFlushes();
@@ -535,6 +537,7 @@ public:
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page unless updated in place.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size, std::span<const u8> data = {});
+    bool CanSkipInlineMemory(DAddr device_addr, u64 size) const;
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
@@ -620,13 +623,26 @@ public:
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
-    struct NativeUniformBankShadow {
+    struct NativeUniformBankState {
         u64 last_draw_ticket{};
         u64 last_frame_tick{~u64{0}};
         u64 last_skipped_draw_ticket{~u64{0}}; ///< Profiler only: bank_once_per_frame skips
         u32 initialized_mask{};
+    };
+    struct NativeUniformBankShadow : NativeUniformBankState {
         std::array<u8, 0x10000> bytes{};
     };
+    struct CompactNativeUniformBankShadow : NativeUniformBankState {
+        std::vector<u8> bytes;
+    };
+    static bool CompactUniformBanksEnabled() {
+        static constexpr bool enabled = true;
+        return enabled;
+    }
+    std::unordered_map<DAddr, CompactNativeUniformBankShadow> compact_uniform_shadows;
+    std::array<std::pair<DAddr, CompactNativeUniformBankShadow*>, 1024> compact_uniform_cache{};
+    DAddr compact_uniform_last_bank = ~DAddr{0};
+    CompactNativeUniformBankShadow* compact_uniform_last_ptr = nullptr;
     std::unordered_map<DAddr, NativeUniformBankShadow> native_indirect_uniform_shadow;
     std::array<std::pair<DAddr, NativeUniformBankShadow*>, 8> native_indirect_uniform_cache{};
     DAddr native_indirect_uniform_last_bank = ~DAddr{0};
@@ -659,6 +675,13 @@ public:
     };
     std::array<std::array<BindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_bind_memo{};
     std::array<std::array<BindMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES> storage_bind_memo{};
+    struct GeometryMemo {
+        BindMemo binding;
+        size_t memory_id{};
+        u64 map_serial{};
+    };
+    std::array<GeometryMemo, NUM_VERTEX_BUFFERS> geometry_vertex_memo{};
+    GeometryMemo geometry_index_memo{};
     u64 bind_memo_mismatches = 0;
 
     static constexpr size_t ResolvedStorageAddrCacheSize = 4096;
@@ -710,6 +733,8 @@ private:
     }
 
     void RunGarbageCollector(bool aggressive_gc);
+
+    void SynchronizeGeometryBuffer(GeometryMemo& memo, Buffer& buffer, const Binding& binding);
 
     void BindHostIndexBuffer();
 
@@ -1020,6 +1045,12 @@ private:
     Common::RangeSet<DAddr> cpu_read_ranges;
     bool download_cpu_read_ranges{};
     Common::RangeSet<DAddr> gpu_modified_ranges;
+    // Never cleared: a clear bit proves that InlineMemory has no GPU data on that page.
+    PageFilter inline_gpu_write_filter;
+    static bool InlineLockFilterEnabled() {
+        static constexpr bool enabled = true;
+        return enabled;
+    }
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers
@@ -1102,10 +1133,7 @@ private:
         const char* value = std::getenv("EDEN_NX2_LIST_COPY_LOG");
         return value != nullptr && value[0] == '1';
     }();
-    const bool nx2_list_copy_demand = [] {
-        const char* value = std::getenv("EDEN_NX2_LIST_COPY_DEMAND");
-        return value != nullptr && value[0] == '1';
-    }();
+    static constexpr bool nx2_list_copy_demand = true;
     u64 nx2_list_copy_shader{}; ///< Back thread only; zero also covers DMA and inline writes.
     struct Nx2ListCopyStats {
         u64 copies{}, bytes{}, replaced_unread{}, copied{}, synced{}, misses{}, waits{};

@@ -99,6 +99,19 @@ bool Scheduler::DeferFlush() {
     return true;
 }
 
+bool Scheduler::DeferListCopyFlush() {
+    if (!Nx2Sync::MergeWaits()) {
+        return !VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) && DeferFlush();
+    }
+    if (!VideoCommon::GpuSplit::OnBackThread() ||
+        VideoCommon::GpuSplit::Get().FrontWaitsForBack() ||
+        std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{100}) {
+        return false;
+    }
+    flush_pending = true;
+    return true;
+}
+
 void Scheduler::FlushDeferred() {
     if (flush_pending) {
         Flush();
@@ -138,6 +151,16 @@ bool Scheduler::WaitSubmitted(u64 tick) {
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
+    }
+    if (Nx2Sync::MergeWaits()) {
+        if (uploads_pending) {
+            FlushUploads();
+        }
+        EndPendingOperations();
+        if (!commands_pending && !signal_semaphore && !wait_semaphore) {
+            master_semaphore->Wait(CurrentTick() - 1);
+            return;
+        }
     }
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
@@ -454,6 +477,10 @@ void Scheduler::AllocateWorkerCommandBuffer() {
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    if (Nx2Sync::HostImportChunks()) {
+        // One startup barrier, before any queue submission can race a host import.
+        master_semaphore->HostImportWarmup().Close();
+    }
     if (uploads_pending) {
         FlushUploads();
     }
@@ -504,6 +531,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             break;
         }
     });
+    commands_pending = false;
     chunk->MarkSubmit();
     DispatchWork();
     // Handed to the worker: wakes threads in WaitSubmitted.
@@ -629,7 +657,6 @@ void Scheduler::EndRenderPass()
             ReleasePass();
         }
     }
-
 
 void Scheduler::AcquireNewChunk() {
     chunk = TakeReserveChunk();

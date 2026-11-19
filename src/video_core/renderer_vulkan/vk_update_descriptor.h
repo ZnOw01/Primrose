@@ -10,6 +10,7 @@
 #pragma once
 
 #include <array>
+#include <cstdlib>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -83,19 +84,11 @@ public:
     }
 
     void AddSampledImage(VkImageView image_view, VkSampler sampler) {
-        *(payload_cursor++) = VkDescriptorImageInfo{
-            .sampler = sampler,
-            .imageView = image_view,
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
+        AddImageInfo(image_view, sampler);
     }
 
     void AddImage(VkImageView image_view) {
-        *(payload_cursor++) = VkDescriptorImageInfo{
-            .sampler = VK_NULL_HANDLE,
-            .imageView = image_view,
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
+        AddImageInfo(image_view, VK_NULL_HANDLE);
     }
 
     void AddBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
@@ -137,6 +130,23 @@ public:
     }
 
 private:
+    void AddImageInfo(VkImageView image_view, VkSampler sampler) {
+        static constexpr bool direct = true;
+        if (direct) {
+            DescriptorUpdateEntry& entry = *(payload_cursor++);
+            entry.raw[2] = 0;
+            entry.image.sampler = sampler;
+            entry.image.imageView = image_view;
+            entry.image.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        } else {
+            *(payload_cursor++) = VkDescriptorImageInfo{
+                .sampler = sampler,
+                .imageView = image_view,
+                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            };
+        }
+    }
+
     void AcquireOverflow(Scheduler& scheduler, size_t reserve);
 
     const Device& device;

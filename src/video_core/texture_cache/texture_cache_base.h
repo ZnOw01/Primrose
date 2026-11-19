@@ -101,6 +101,21 @@ public:
     std::unordered_map<TICEntry, ImageViewId> image_views;
     std::unordered_map<TSCEntry, SamplerId> samplers;
 
+    struct ValidImageEntry {
+        std::array<u64, 4> raw{};
+        size_t memory_id{};
+        u64 map_serial{};
+        bool valid{};
+    };
+    std::array<ValidImageEntry, 64> valid_image_entries{};
+    struct ResolvedImageEntry {
+        std::array<u64, 4> raw{};
+        size_t memory_id{};
+        u64 map_serial{};
+        ImageViewId id{};
+    };
+    std::array<ResolvedImageEntry, 256> resolved_image_entries{};
+
     TextureCacheGPUMap* gpu_page_table = nullptr;
     TextureCacheGPUMap* sparse_page_table = nullptr;
 };

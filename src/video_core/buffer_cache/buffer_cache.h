@@ -23,6 +23,7 @@
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
+#include "video_core/buffer_cache/buffer_bytes_equal.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
@@ -121,19 +122,11 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
-    if (nx2_buffer_deps && frame_tick % 600 == 0) {
-        LOG_INFO(HW_GPU, "nx2 buffer deps snapshot: frame {} rows {}", frame_tick,
-                 nx2_buffer_deps->Edges().size());
-        for (const auto& [edge, s] : nx2_buffer_deps->Edges()) {
-            LOG_INFO(HW_GPU,
-                     "nx2 buffer deps: consumer {:016x} input {} producer {} {:016x}: "
-                     "{} range observations, {} bytes, {} same-frame bytes, {} CPU-dirty "
-                     "observations; {} ranges, {} history resets, {} drops",
-                     edge.consumer, static_cast<u32>(edge.input), static_cast<u32>(edge.producer),
-                     edge.shader, s.observations, s.bytes, s.recent_bytes,
-                     s.cpu_dirty_observations, nx2_buffer_deps->RangeCount(),
-                     nx2_buffer_deps->Resets(), nx2_buffer_deps->Drops());
-        }
+    if (compact_uniform_shadows.size() > 4096) {
+        compact_uniform_shadows.clear();
+        compact_uniform_cache.fill({~DAddr{0}, nullptr});
+        compact_uniform_last_bank = ~DAddr{0};
+        compact_uniform_last_ptr = nullptr;
     }
     if (native_indirect_uniform_shadow.size() > 256) {
         native_indirect_uniform_shadow.clear();
@@ -519,6 +512,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     gpu_modified_ranges.Subtract(*cpu_dest_address, amount);
     const bool has_new_downloads = tmp_intervals.size() != 0;
     for (const auto& pair : tmp_intervals) {
+        if (InlineLockFilterEnabled()) {
+            inline_gpu_write_filter.Mark(pair.first, pair.second);
+        }
         gpu_modified_ranges.Add(pair.first, pair.second);
         if (nx2_buffer_deps) {
             nx2_buffer_deps->Write(pair.first, pair.second,
@@ -1034,6 +1030,16 @@ void BufferCache<P>::CommitAsyncFlushes() {
 }
 
 template <class P>
+bool BufferCache<P>::CommitAsyncFlushesIfNeeded() {
+    CommitAsyncFlushes();
+    if (async_buffers.back().has_value()) {
+        return true;
+    }
+    async_buffers.pop_back();
+    return false;
+}
+
+template <class P>
 u64 BufferCache<P>::Nx2BatchDownloads(const Nx2Downloads& downloads, Nx2Downloads& batched) {
     // Ocarina downloaded ~13 ranges per fence, each its own recorded copy command. Merged ranges
     // copy their gap (at most 4 KiB) to staging too, but PopAsyncBuffers writes back only
@@ -1351,15 +1357,37 @@ bool BufferCache<P>::IsRegionCpuModified(DAddr addr, size_t size) {
 }
 
 template <class P>
+void BufferCache<P>::SynchronizeGeometryBuffer(GeometryMemo& memo, Buffer& buffer,
+                                              const Binding& binding) {
+    static constexpr bool enabled = true;
+    const bool can_memo = enabled && !IS_OPENGL && binding.buffer_id != NULL_BUFFER_ID;
+    const size_t memory_id = can_memo ? gpu_memory->GetID() : 0;
+    const u64 map_serial = can_memo ? gpu_memory->GetMapSerial() : 0;
+    if (can_memo && memo.memory_id == memory_id && memo.map_serial == map_serial &&
+        BindMemoHit(memo.binding, buffer, binding.buffer_id, binding.device_addr, binding.size,
+                    buffer.Offset(binding.device_addr), "geometry", 0, 0)) {
+        return;
+    }
+    const u64 cpu_epoch = memory_tracker.CpuEpoch();
+    TouchBuffer(buffer, binding.buffer_id);
+    SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+    if (can_memo) {
+        BindMemoNote(memo.binding, binding.buffer_id, binding.device_addr, binding.size, cpu_epoch);
+        memo.memory_id = memory_id;
+        memo.map_serial = map_serial;
+    }
+}
+
+template <class P>
 void BufferCache<P>::BindHostIndexBuffer() {
     Buffer& buffer = slot_buffers[channel_state->index_buffer.buffer_id];
-    TouchBuffer(buffer, channel_state->index_buffer.buffer_id);
     const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
     const u32 size = channel_state->index_buffer.size;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (draw_state.inline_index_draw_indexes.empty()) {
-        SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+        SynchronizeGeometryBuffer(geometry_index_memo, buffer, channel_state->index_buffer);
     } else {
+        TouchBuffer(buffer, channel_state->index_buffer.buffer_id);
         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
             auto upload_staging = runtime.UploadStagingBuffer(size);
             std::array<BufferCopy, 1> copies{
@@ -1485,8 +1513,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
             enabled_mask &= (enabled_mask - 1);
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
-            TouchBuffer(buffer, binding.buffer_id);
-            SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            SynchronizeGeometryBuffer(geometry_vertex_memo[index], buffer, binding);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;
@@ -1515,8 +1542,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
         for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
             const Binding& binding = channel_state->vertex_buffers[index];
             Buffer& buffer = slot_buffers[binding.buffer_id];
-            TouchBuffer(buffer, binding.buffer_id);
-            SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            SynchronizeGeometryBuffer(geometry_vertex_memo[index], buffer, binding);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 continue;
             }
@@ -1630,6 +1656,16 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     Buffer& buffer = slot_buffers[binding.buffer_id];
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
     const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
+    static constexpr bool reuse_gpu_query = true;
+    bool gpu_query_valid = false;
+    bool gpu_modified = false;
+    const auto is_gpu_modified = [&] {
+        if (!reuse_gpu_query || !gpu_query_valid) {
+            gpu_modified = memory_tracker.IsRegionGpuModified(device_addr, size);
+            gpu_query_valid = true;
+        }
+        return gpu_modified;
+    };
     const bool needs_alignment_stream = [&]() {
         if constexpr (IS_OPENGL) {
             return false;
@@ -1670,10 +1706,35 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             gpu_memory->UsesNativeTiling() &&
             (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
             VideoCommon::Nx2Knob::Live(import_start, VideoCommon::Nx2Knob::HostImport) &&
-            !memory_tracker.IsRegionGpuModified(device_addr, size)) {
+            !is_gpu_modified()) {
             static std::atomic<u64> imported{0}, copied{0}, no_span{0}, no_import{0};
             const u8* const host_ptr = device_memory.GetSpan(device_addr, size);
-            if (host_ptr != nullptr && runtime.TryBindImportedUniformBuffer(host_ptr, size)) {
+            const bool bound = [&] {
+                if (host_ptr == nullptr) {
+                    return false;
+                }
+                if constexpr (requires { runtime.HostImportChunkSize(); }) {
+                    const uintptr_t chunk_size = runtime.HostImportChunkSize();
+                    if (chunk_size != 0) {
+                        const uintptr_t chunk_offset =
+                            reinterpret_cast<uintptr_t>(host_ptr) & (chunk_size - 1);
+                        if (device_addr < chunk_offset || size > chunk_size - chunk_offset) {
+                            return false;
+                        }
+                        const u8* const chunk =
+                            device_memory.GetSpan(device_addr - chunk_offset, chunk_size);
+                        if (chunk == nullptr ||
+                            reinterpret_cast<uintptr_t>(chunk) !=
+                                reinterpret_cast<uintptr_t>(host_ptr) - chunk_offset) {
+                            return false;
+                        }
+                        return runtime.TryBindImportedUniformBuffer(
+                            host_ptr, size, std::span<const u8>{chunk, chunk_size});
+                    }
+                }
+                return runtime.TryBindImportedUniformBuffer(host_ptr, size);
+            }();
+            if (bound) {
                 channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
                 const u64 count = imported.fetch_add(1, std::memory_order_relaxed) + 1;
                 if ((count % 500000) == 0) {
@@ -1690,6 +1751,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             (host_ptr == nullptr ? no_span : no_import).fetch_add(1, std::memory_order_relaxed);
         }
     }
+    static constexpr bool compare_dirty_banks = true;
     if (bank_mode != '0' && has_host_buffer && size != 0 && gpu_memory != nullptr &&
         gpu_memory->UsesNativeTiling() &&
         (bank_mode == '3' || (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000)) {
@@ -1697,21 +1759,50 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         // Only mark 4 KiB pages whose guest bytes actually changed since the last upload so
         // unchanged banks do not toggle VirtualProtect or break the Vulkan render pass on every draw.
-        NativeUniformBankShadow* shadow = nullptr;
-        if (device_addr == native_indirect_uniform_last_bank &&
-            native_indirect_uniform_last_ptr != nullptr) [[likely]] {
-            shadow = native_indirect_uniform_last_ptr;
-        } else {
-            const size_t cache_idx = ((device_addr >> 12) ^ (device_addr >> 20)) & 7;
-            auto& cached = native_indirect_uniform_cache[cache_idx];
-            if (cached.first == device_addr && cached.second != nullptr) [[likely]] {
-                shadow = cached.second;
+        NativeUniformBankState* shadow = nullptr;
+        std::span<u8> shadow_bytes;
+        if (CompactUniformBanksEnabled()) {
+            CompactNativeUniformBankShadow* compact = nullptr;
+            if (device_addr == compact_uniform_last_bank && compact_uniform_last_ptr != nullptr) {
+                compact = compact_uniform_last_ptr;
             } else {
-                shadow = &native_indirect_uniform_shadow[device_addr];
-                cached = {device_addr, shadow};
+                const size_t cache_idx = ((device_addr >> 4) ^ (device_addr >> 14) ^
+                                          (device_addr >> 24)) & (compact_uniform_cache.size() - 1);
+                auto& cached = compact_uniform_cache[cache_idx];
+                if (cached.first == device_addr && cached.second != nullptr) {
+                    compact = cached.second;
+                } else {
+                    compact = &compact_uniform_shadows[device_addr];
+                    cached = {device_addr, compact};
+                }
+                compact_uniform_last_bank = device_addr;
+                compact_uniform_last_ptr = compact;
             }
-            native_indirect_uniform_last_bank = device_addr;
-            native_indirect_uniform_last_ptr = shadow;
+            const u32 check_size = (std::min<u32>)(size, 0x10000U);
+            if (compact->bytes.size() < check_size) {
+                compact->bytes.resize(check_size);
+            }
+            shadow = compact;
+            shadow_bytes = compact->bytes;
+        } else {
+            NativeUniformBankShadow* legacy = nullptr;
+            if (device_addr == native_indirect_uniform_last_bank &&
+                native_indirect_uniform_last_ptr != nullptr) [[likely]] {
+                legacy = native_indirect_uniform_last_ptr;
+            } else {
+                const size_t cache_idx = ((device_addr >> 12) ^ (device_addr >> 20)) & 7;
+                auto& cached = native_indirect_uniform_cache[cache_idx];
+                if (cached.first == device_addr && cached.second != nullptr) [[likely]] {
+                    legacy = cached.second;
+                } else {
+                    legacy = &native_indirect_uniform_shadow[device_addr];
+                    cached = {device_addr, legacy};
+                }
+                native_indirect_uniform_last_bank = device_addr;
+                native_indirect_uniform_last_ptr = legacy;
+            }
+            shadow = legacy;
+            shadow_bytes = legacy->bytes;
         }
         // Nx2Perf bank_once_per_frame: compare the guest bytes on the frame's first bind only.
         // Verify (which always takes the per-draw path) reports changes that path would have
@@ -1724,11 +1815,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             if (Nx2Profile::Enabled() &&
                 shadow->last_draw_ticket != native_indirect_uniform_draw_ticket &&
                 shadow->last_skipped_draw_ticket != native_indirect_uniform_draw_ticket &&
-                !memory_tracker.IsRegionGpuModified(device_addr, size)) {
+                !is_gpu_modified()) {
                 shadow->last_skipped_draw_ticket = native_indirect_uniform_draw_ticket;
                 Nx2Profile::Add(Nx2Profile::Counter::BankRechecksSkippedByFrame, 1);
             }
-        } else if (!memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        } else if (!is_gpu_modified()) {
             const bool check_late = once_per_frame && seen_this_frame;
             shadow->last_frame_tick = frame_tick;
             if (shadow->last_draw_ticket != native_indirect_uniform_draw_ticket) {
@@ -1757,9 +1848,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                     const bool page_initialized = (shadow->initialized_mask & page_bit) != 0;
                     const bool already_cpu_modified =
                         memory_tracker.IsRegionCpuModified(cur_addr, chunk_size);
-                    u8* const shadow_dst = shadow->bytes.data() + offset_in_bank;
-                    if (!page_initialized || already_cpu_modified ||
-                        std::memcmp(shadow_dst, ptr, chunk_size) != 0) {
+                    u8* const shadow_dst = shadow_bytes.data() + offset_in_bank;
+                    if (!page_initialized || (!compare_dirty_banks && already_cpu_modified) ||
+                        !BufferBytesEqual(shadow_dst, ptr, chunk_size)) {
                         if (check_late && page_initialized && !already_cpu_modified)
                             [[unlikely]] {
                             static std::atomic<u64> late_changes{};
@@ -1794,7 +1885,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const bool use_fast_buffer =
         needs_alignment_stream ||
         (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
-         !memory_tracker.IsRegionGpuModified(device_addr, size));
+         !is_gpu_modified());
     if (use_fast_buffer) {
         Nx2Profile::Scope stream_scope{Nx2Profile::Zone::BindUniformStream};
         if constexpr (IS_OPENGL) {
@@ -2343,6 +2434,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         return;
     }
     const auto& array = maxwell3d->regs.vertex_streams[index];
+    static constexpr bool early_disabled = true;
+    if (early_disabled && array.enable == 0) {
+        channel_state->vertex_buffers[index] = NULL_BINDING;
+        UpdateVertexBufferSlot(index, NULL_BINDING);
+        return;
+    }
     const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
     const GPUVAddr gpu_addr_begin = array.Address();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
@@ -2580,6 +2677,9 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     memory_tracker.MarkRegionAsGpuModified(device_addr, size); // Bumps the GPU epoch
     MarkVertexBuffersStale(device_addr, size);
     last_synced_count = 0;
+    if (InlineLockFilterEnabled()) {
+        inline_gpu_write_filter.Mark(device_addr, size);
+    }
     gpu_modified_ranges.Add(device_addr, size);
     QueueGpuWrite(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
@@ -2663,9 +2763,6 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
                 std::scoped_lock lock{nx2_list_mutex};
                 const auto it = nx2_list_pages.find(page);
                 if (it != nx2_list_pages.end() && !it->second.demand.ShouldCopy()) {
-                    if (nx2_list_copy_log) {
-                        ++nx2_list_copy_stats.demand_skipped;
-                    }
                     continue;
                 }
             }
@@ -2800,8 +2897,8 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
                 }
                 return Nx2ListRead::Synced;
             }
-            if (nx2_list_copy_demand && entry.demand.Request() && nx2_list_copy_log) {
-                ++nx2_list_copy_stats.demand_promoted;
+            if (nx2_list_copy_demand) {
+                entry.demand.Request();
             }
             if (!current(entry)) {
                 if (nx2_list_copy_log) {
@@ -3223,6 +3320,17 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         return true;
     }
     const DAddr range_end = device_addr + size;
+    static constexpr bool reuse_clean = true;
+    const bool can_reuse_clean = reuse_clean && !IS_OPENGL;
+    static constexpr bool fused_clean = true;
+    const bool gather_clean = fused_clean && can_reuse_clean && !Nx2Perf::Verify();
+    bool upload_clean = true;
+    const u64 cpu_epoch = can_reuse_clean ? memory_tracker.CpuEpoch() : 0;
+    if (can_reuse_clean && buffer.upload_clean_epoch == cpu_epoch &&
+        buffer.upload_clean_begin <= device_addr && range_end <= buffer.upload_clean_end &&
+        !Nx2Perf::Verify()) {
+        return true;
+    }
     if (native_indirect_uniform_draw_ticket != 0) {
         if (last_synced_draw_ticket != native_indirect_uniform_draw_ticket) {
             last_synced_draw_ticket = native_indirect_uniform_draw_ticket;
@@ -3238,6 +3346,20 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         }
     }
     const auto note_synced_range = [&]() {
+        // Hot pages stay dirty and unprotected after a walk: they cannot seed this proof.
+        if (can_reuse_clean &&
+            (gather_clean ? upload_clean : memory_tracker.IsRegionUploadClean(device_addr, size)) &&
+            memory_tracker.CpuEpoch() == cpu_epoch) {
+            if (buffer.upload_clean_epoch == cpu_epoch &&
+                buffer.upload_clean_begin <= range_end && device_addr <= buffer.upload_clean_end) {
+                buffer.upload_clean_begin = (std::min)(buffer.upload_clean_begin, device_addr);
+                buffer.upload_clean_end = (std::max)(buffer.upload_clean_end, range_end);
+            } else {
+                buffer.upload_clean_epoch = cpu_epoch;
+                buffer.upload_clean_begin = device_addr;
+                buffer.upload_clean_end = range_end;
+            }
+        }
         if (native_indirect_uniform_draw_ticket == 0) {
             return;
         }
@@ -3265,10 +3387,11 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         }
     }
     const auto for_each_upload_range = [&](auto&& func) {
+        bool* const clean = gather_clean ? &upload_clean : nullptr;
         if (skip_clean) {
-            memory_tracker.ForEachDirtyUploadRange(device_addr, size, func);
+            memory_tracker.ForEachDirtyUploadRange(device_addr, size, func, clean);
         } else {
-            memory_tracker.ForEachUploadRange(device_addr, size, func);
+            memory_tracker.ForEachUploadRange(device_addr, size, func, clean);
         }
     };
 #ifdef __ANDROID__
@@ -3402,6 +3525,31 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     }
+}
+
+template <class P>
+bool BufferCache<P>::CanSkipInlineMemory(DAddr device_addr, u64 size) const {
+    if (!InlineLockFilterEnabled() || !GpuSplit::OnBackThread() || size == 0) {
+        return false;
+    }
+    const DAddr begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+    const DAddr end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
+    if (end <= begin || inline_gpu_write_filter.Any(begin, end - begin)) {
+        return false;
+    }
+    constexpr u64 page_bits = Tegra::Nx2WrittenPageBits;
+    const u64 last = (device_addr + size - 1) >> page_bits;
+    if (last >= Tegra::g_nx2_command_list_pages.size() * 64) {
+        return false;
+    }
+    for (u64 page = device_addr >> page_bits; page <= last; ++page) {
+        if ((Tegra::g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >>
+             (page % 64)) &
+            1) {
+            return false;
+        }
+    }
+    return true;
 }
 
 template <class P>

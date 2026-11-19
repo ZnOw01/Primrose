@@ -224,8 +224,10 @@ struct WordManager {
     /// @param query_cpu_range Base CPU address to loop over
     /// @param size            Size in bytes of the CPU range to loop over
     /// @param func            Function to call for each turned off region
+    /// @param upload_clean    Optional all-clean accumulator for a CPU/clear upload walk
     template <typename Func>
-    void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func) {
+    void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func,
+                              bool* upload_clean = nullptr) {
         //static_assert(type != Type::Untracked);
         const bool hot_pages = HotPagesEnabled() && clear && type == Type::CPU;
         if (hot_pages) {
@@ -251,6 +253,11 @@ struct WordManager {
             // Hot pages uploaded since the frame began are not modified again until the next frame.
             const u64 hot_clean = hot_pages ? hot_words[index] & hot_clean_words[index] & mask : 0;
             const u64 word = state_words[index] & mask & ~hot_clean;
+            // Only hot pages retain CPU/Untracked bits after a CPU upload walk.
+            if (upload_clean != nullptr && hot_pages &&
+                ((state_words[index] | untracked_words[index]) & hot_words[index] & mask) != 0) {
+                *upload_clean = false;
+            }
             if (word == 0 &&
                 (!clear || ((type != Type::CPU && type != Type::CachedCPU) ||
                             (untracked_words[index] & mask) == 0))) {

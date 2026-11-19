@@ -80,8 +80,15 @@ public:
     virtual Result HandleSyncRequest(Kernel::KServerSession& session,
                                      HLERequestContext& context) = 0;
 
+    [[nodiscard]] const char* HandlerName() const noexcept {
+        return handler_name;
+    }
+
 protected:
     Kernel::KernelCore& kernel;
+
+private:
+    const char* handler_name;
 };
 
 using SessionRequestHandlerWeakPtr = std::weak_ptr<SessionRequestHandler>;
@@ -200,6 +207,10 @@ public:
 
     /// Returns a pointer to the IPC command buffer for this request.
     [[nodiscard]] u32* CommandBuffer() {
+        return cmd_buf.data();
+    }
+
+    [[nodiscard]] const u32* CommandBuffer() const {
         return cmd_buf.data();
     }
 

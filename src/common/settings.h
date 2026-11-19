@@ -522,6 +522,8 @@ struct Values {
                                                             Specialization::Default,
                                                             true,
                                                             true};
+    SwitchableSetting<bool> fullscreen_on_launch{linkage, false, "fullscreen_on_launch",
+                                                 Category::Renderer};
 
     SwitchableSetting<u8, false> bg_red{
                                         linkage, 0, "bg_red", Category::Renderer, Specialization::Default, true, true};
@@ -628,9 +630,13 @@ struct Values {
         linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
         Specialization::Default};
 
-    // Off: task/mesh draws take the compute fallback even when the device has VK_EXT_mesh_shader.
-    SwitchableSetting<bool> use_mesh_shaders{linkage, true, "use_mesh_shaders",
-                                             Category::RendererAdvanced};
+    // How task/mesh draws run on a device with VK_EXT_mesh_shader: Native uses its task and mesh
+    // stages, ComputeFallback the compute path a device without it uses, Auto the fallback on AMD
+    // drivers and the native stages elsewhere (Vulkan::Device::RemoveUnsuitableExtensions).
+    // Replaces the use_mesh_shaders bool; Config::MigrateMeshShaderSetting maps its old value.
+    SwitchableSetting<MeshShaderMode> mesh_shader_mode{linkage, MeshShaderMode::Auto,
+                                                       "mesh_shader_mode",
+                                                       Category::RendererAdvanced};
 
     // Linux: the GPU driver's shader cache in a folder of our own (ConfigureDriverShaderCache),
     // with its size limit in GiB. Applied at startup, before anything loads a driver.

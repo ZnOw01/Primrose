@@ -30,6 +30,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
@@ -117,6 +118,25 @@ void GpuSplit::CheckOwner(const char* where) {
 
 GpuSplit GpuSplit::instance;
 
+bool GpuSplit::WritePipeEnabled() {
+    static constexpr bool enabled = true;
+    return enabled && !Nx2Perf::Verify();
+}
+
+bool GpuSplit::AcquireKnownReleaseEnabled() {
+    static constexpr bool enabled = true;
+    return enabled;
+}
+
+bool GpuSplit::PayloadReleaseSynchronous(bool is_fence) {
+    if (!is_fence) {
+        return !Settings::IsGPULevelHigh();
+    }
+    return Settings::IsGPUFenceBehaviorDefault()
+               ? !Settings::IsGPULevelHigh()
+               : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate();
+}
+
 void GpuSplit::MaybeStart(Core::System& system_) {
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPLIT");
@@ -187,6 +207,7 @@ void GpuSplit::Stop() {
     published_local = 0;
     consumed_cache = 0;
     repeat_end = ~u64{0};
+    instance_pair_end = ~u64{0};
     publish_every = PublishEvery;
     front_engine = nullptr;
     back_engine = nullptr;
@@ -276,6 +297,18 @@ void GpuSplit::Drain(DrainSite site) {
             hook_requested.store(true, std::memory_order_release);
         }
         Backoff(spins, write_position);
+    }
+}
+
+void GpuSplit::WaitForPending(DrainSite site) {
+    static constexpr bool ordered = true;
+    if (!active) {
+        return;
+    }
+    if (ordered) {
+        WaitFor(write_position, site);
+    } else {
+        Drain(site);
     }
 }
 
@@ -400,6 +433,21 @@ bool GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u
     return true;
 }
 
+void GpuSplit::NoteRelease(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                            u32 value, bool synchronous) {
+    const bool noted = NoteWrite(memory, address, size, WriteKind::Other);
+    if (const auto device = memory.GpuToCpuAddress(address)) {
+        if (AcquireKnownReleaseEnabled() && synchronous && noted && (address & 3) == 0) {
+            writes.Release(*device, write_position, value);
+            if (size >= sizeof(u64)) {
+                writes.Release(*device + sizeof(u32), write_position, 0);
+            }
+        } else {
+            NoteAsyncWrite(*device, size);
+        }
+    }
+}
+
 void GpuSplit::NoteConstBufferWrite(const Tegra::MemoryManager& memory, GPUVAddr address,
                                     const u32* words, u32 count, u32 stored) {
     const bool noted =
@@ -513,17 +561,73 @@ void GpuSplit::VerifyRepeat(u64 head) {
     verify_previous = word;
 }
 
-size_t GpuSplit::Execute(const u64* entry, size_t words) {
-    const u64 head = entry[0];
-    if (verify_repeats) [[unlikely]] {
-        VerifyRepeat(head);
+GpuSplit::Kind GpuSplit::MethodKind(const Tegra::Engines::EngineInterface* engine, u32 method,
+                                    bool has_segment) {
+    static constexpr bool tag_state = true;
+    static constexpr bool tag_maxwell = true;
+    using Tegra::Engines::Maxwell3D;
+    if (tag_state && engine->fast_maxwell3d && !has_segment && method < Maxwell3D::Regs::NUM_REGS &&
+        !engine->execution_mask[method] && !Nx2Perf::Verify()) {
+        return Kind::StateMethod;
     }
+    if (tag_maxwell && engine->fast_maxwell3d && !has_segment &&
+        method < Maxwell3D::Regs::NUM_REGS && engine->execution_mask[method] &&
+        !Nx2Perf::Verify()) {
+        return Kind::MaxwellMethod;
+    }
+    return Kind::Method;
+}
+
+void GpuSplit::StateMethodRun(Tegra::Engines::EngineInterface* engine, u32 method,
+                              const u32* arguments, u32 count, Effect effect) {
+    if (count == 0) {
+        return;
+    }
+    DEBUG_ASSERT(count <= 64);
+    if (count < 4 || !WritePipeEnabled() ||
+        MethodKind(engine, method, false) != Kind::StateMethod) {
+        for (u32 i = 0; i < count; ++i) {
+            Method(engine, method + i, arguments[i], true, nullptr, effect);
+        }
+        return;
+    }
+    SelectEngine(engine);
+    const size_t words = 1 + (count + 1) / 2;
+    u64* const entry = Reserve(words);
+    entry[0] = static_cast<u64>(Kind::StateBlock) | (u64{method} << 8) | (u64{count} << 32);
+    entry[words - 1] = 0;
+    std::memcpy(entry + 1, arguments, size_t{count} * sizeof(u32));
+    Commit(words, effect);
+}
+
+size_t GpuSplit::Execute(const u64* entry, size_t words) {
+    if (verify_repeats) [[unlikely]] {
+        VerifyRepeat(entry[0]);
+    }
+    return ExecuteImpl(entry, words);
+}
+
+YUZU_NO_INLINE size_t GpuSplit::ExecuteImpl(const u64* entry, size_t words) {
+    const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
     case Kind::Wrap:
         return 0;
     case Kind::Engine:
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         return 2;
+    case Kind::StateBlock: {
+        const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+        const u32 count = static_cast<u32>(head >> 32);
+        auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(back_engine);
+        maxwell3d->ConsumeSink(*system);
+        maxwell3d->CallStateMethodBlock(method, reinterpret_cast<const u32*>(entry + 1), count);
+        return 1 + (count + 1) / 2;
+    }
+    case Kind::StateMethod: {
+        auto* const maxwell3d = static_cast<Tegra::Engines::Maxwell3D*>(back_engine);
+        maxwell3d->ConsumeSink(*system);
+        return maxwell3d->CallStateMethodRun(entry, words, true);
+    }
     case Kind::Method: {
         if ((head & RepeatMask) != 0) [[unlikely]] {
             ExecuteRepeated(head);
@@ -532,85 +636,115 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
-        if (engine->fast_maxwell3d) {
-            // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
-            // virtual call.
-            using Tegra::Engines::Maxwell3D;
-            auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
-            constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
-            if (method - cb_data < 16 && (head & HasSegment) == 0 &&
-                Nx2Perf::On(Nx2Perf::Opt::CbBatch)) {
-                // Single constant buffer words in a row (macros write them one by one) go up in
-                // one write. They are executable: each entry would only consume the sink first.
-                std::array<u32, 64> methods;
-                std::array<u32, 64> arguments;
-                methods[0] = method;
-                arguments[0] = argument;
-                u32 count = 1;
-                while (count < methods.size() && count < words) {
-                    const u64 next = entry[count];
-                    const u32 next_method = static_cast<u32>((next >> 8) & 0xffff);
-                    if (static_cast<Kind>(next & 0xf) != Kind::Method || (next & HasSegment) != 0 ||
-                        next_method - cb_data >= 16) {
-                        break;
-                    }
-                    methods[count] = next_method;
-                    arguments[count] = static_cast<u32>(next >> 32);
+        if (engine->native_compute &&
+            method == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
+            (head & (HasSegment | RepeatMask)) == 0 && (head & IsLast) != 0) {
+            static constexpr bool batch_inline = true;
+            if (batch_inline) {
+                auto* const compute = static_cast<Tegra::Engines::KeplerCompute*>(engine);
+                compute->ConsumeSink(*system);
+                // Consecutive data words of one linear transfer, with no intervening observer.
+                size_t count = 1;
+                while (count < 64 && count < words &&
+                       static_cast<u32>(entry[count]) == static_cast<u32>(head) &&
+                       compute->CanBatchInlineData(count + 1)) {
                     ++count;
                 }
-                maxwell3d->ConsumeSink(*system);
-                if (count == 1) {
-                    maxwell3d->CallMethod(*system, method, argument, true);
-                } else {
-                    maxwell3d->CallConstBufferWords(*system, methods.data(), arguments.data(),
-                                                    count);
+                if (count > 1) {
+                    Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+                    for (size_t i = 0; i < count; ++i) {
+                        compute->CallMethod(*system, method, static_cast<u32>(entry[i] >> 32),
+                                            i + 1 == count);
+                    }
+                    return count;
                 }
-                return count;
             }
-            if (!maxwell3d->execution_mask[method] && (head & HasSegment) == 0 &&
-                method < Maxwell3D::Regs::NUM_REGS && !Nx2Perf::Verify()) {
-                if (!maxwell3d->method_sink.empty()) [[unlikely]] {
-                    maxwell3d->ConsumeSink(*system);
-                }
-                return maxwell3d->CallStateMethodRun(entry, words);
-            }
+        }
+        if (!engine->fast_maxwell3d) {
             if ((head & Direct) != 0) {
-                maxwell3d->ConsumeSink(*system);
-                maxwell3d->CallMethod(*system, method, argument, true);
-            } else if (!maxwell3d->execution_mask[method]) {
-                maxwell3d->method_sink.emplace_back(method, argument);
-            } else {
-                maxwell3d->ConsumeSink(*system);
-                if ((head & HasSegment) != 0) {
-                    maxwell3d->current_dma_segment = entry[1];
+                static const bool method_fast = [] {
+                    const char* value = std::getenv("EDEN_NX2_METHOD_FAST");
+                    return value == nullptr || value[0] != '0';
+                }();
+                Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+                if (!engine->method_sink.empty()) {
+                    engine->ConsumeSink(*system);
                 }
-                maxwell3d->CallMethod(*system, method, argument, (head & IsLast) != 0);
+                if (method_fast && !engine->execution_mask[method]) {
+                    engine->CallStateMethod(*system, method, argument);
+                } else {
+                    engine->CallMethod(*system, method, argument, true);
+                }
+            } else if (!engine->execution_mask[method]) {
+                engine->method_sink.emplace_back(method, argument);
+            } else {
+                Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+                engine->ConsumeSink(*system);
+                if ((head & HasSegment) != 0) {
+                    engine->current_dma_segment = entry[1];
+                }
+                engine->CallMethod(*system, method, argument, (head & IsLast) != 0);
             }
             return (head & HasSegment) != 0 ? 2 : 1;
         }
-        if ((head & Direct) != 0) {
-            static const bool method_fast = [] {
-                const char* value = std::getenv("EDEN_NX2_METHOD_FAST");
-                return value == nullptr || value[0] != '0';
-            }();
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-            if (!engine->method_sink.empty()) {
-                engine->ConsumeSink(*system);
+        [[fallthrough]];
+    }
+    case Kind::MaxwellMethod: {
+        const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+        const u32 argument = static_cast<u32>(head >> 32);
+        auto* const engine = back_engine;
+        // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
+        // virtual call.
+        using Tegra::Engines::Maxwell3D;
+        auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
+        constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        if (method - cb_data < 16 && (head & HasSegment) == 0 &&
+            Nx2Perf::On(Nx2Perf::Opt::CbBatch)) {
+            // Single constant buffer words in a row (macros write them one by one) go up in
+            // one write. They are executable: each entry would only consume the sink first.
+            std::array<u32, 64> methods;
+            std::array<u32, 64> arguments;
+            methods[0] = method;
+            arguments[0] = argument;
+            u32 count = 1;
+            while (count < methods.size() && count < words) {
+                const u64 next = entry[count];
+                const u32 next_method = static_cast<u32>((next >> 8) & 0xffff);
+                if ((static_cast<Kind>(next & 0xf) != Kind::Method &&
+                     static_cast<Kind>(next & 0xf) != Kind::MaxwellMethod) ||
+                    (next & HasSegment) != 0 || next_method - cb_data >= 16) {
+                    break;
+                }
+                methods[count] = next_method;
+                arguments[count] = static_cast<u32>(next >> 32);
+                ++count;
             }
-            if (method_fast && !engine->execution_mask[method]) {
-                engine->CallStateMethod(*system, method, argument);
+            maxwell3d->ConsumeSink(*system);
+            if (count == 1) {
+                maxwell3d->CallMethod(*system, method, argument, true);
             } else {
-                engine->CallMethod(*system, method, argument, true);
+                maxwell3d->CallConstBufferWords(*system, methods.data(), arguments.data(), count);
             }
-        } else if (!engine->execution_mask[method]) {
-            engine->method_sink.emplace_back(method, argument);
+            return count;
+        }
+        if (!maxwell3d->execution_mask[method] && (head & HasSegment) == 0 &&
+            method < Maxwell3D::Regs::NUM_REGS && !Nx2Perf::Verify()) {
+            if (!maxwell3d->method_sink.empty()) [[unlikely]] {
+                maxwell3d->ConsumeSink(*system);
+            }
+            return maxwell3d->CallStateMethodRun(entry, words);
+        }
+        if ((head & Direct) != 0) {
+            maxwell3d->ConsumeSink(*system);
+            maxwell3d->CallMethod(*system, method, argument, true);
+        } else if (!maxwell3d->execution_mask[method]) {
+            maxwell3d->method_sink.emplace_back(method, argument);
         } else {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-            engine->ConsumeSink(*system);
+            maxwell3d->ConsumeSink(*system);
             if ((head & HasSegment) != 0) {
-                engine->current_dma_segment = entry[1];
+                maxwell3d->current_dma_segment = entry[1];
             }
-            engine->CallMethod(*system, method, argument, (head & IsLast) != 0);
+            maxwell3d->CallMethod(*system, method, argument, (head & IsLast) != 0);
         }
         return (head & HasSegment) != 0 ? 2 : 1;
     }
@@ -652,6 +786,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
+    static constexpr bool direct_loop = true;
+    static constexpr bool short_spin = true;
+    const u32 spin_limit = short_spin ? 256 : 8192;
+    const u64* const ring_data = ring.get();
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
@@ -660,7 +798,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             back_idle.store(true, std::memory_order_relaxed);
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
+            for (u32 spins = 0; spins < spin_limit && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
                 Pause();
@@ -699,10 +837,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 last_store = read_position;
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
+        const bool plain_replay = direct_loop && !verify_repeats;
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             size_t size;
-            {
+            if (plain_replay && !Nx2Profile::Enabled()) {
+                size = ExecuteImpl(ring_data + index,
+                                   std::min<u64>(available - read_position, RingWords - index));
+            } else {
                 Nx2Profile::Scope replay_scope{Nx2Profile::Zone::BackReplay};
                 size = Execute(&ring[index],
                                std::min<u64>(available - read_position, RingWords - index));

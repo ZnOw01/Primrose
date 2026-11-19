@@ -15,6 +15,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 #include <span>
 
@@ -130,6 +131,21 @@ public:
     void UnregisterProcess(Asid id);
 
     void UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta);
+
+    /// Whether any cache (buffer tracker, texture cache, shader cache) tracks a page of this range
+    /// at this device address. A physical page can be mapped at several device addresses; a cache
+    /// counts only the addresses it uses, so a guest write needs no rasterizer notification for
+    /// the other aliases. Lock free (the counters are atomic).
+    [[nodiscard]] bool IsAnyPageCached(DAddr addr, size_t size) const {
+        const size_t page_end = (addr + size + page_size - 1) >> page_bits; // = YUZU_PAGEBITS
+        for (size_t page = addr >> page_bits; page < page_end; ++page) {
+            if (cached_pages->at(page >> subentries_shift).Count(page).load(
+                    std::memory_order_acquire) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // New batch API to update multiple ranges with a single lock acquisition.
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
@@ -270,8 +286,10 @@ private:
     using CachedPages = std::array<CounterEntry, num_counter_entries>;
     std::unique_ptr<CachedPages> cached_pages;
     Common::RangeMutex counter_guard;
-    std::mutex mapping_guard;
-
+    /// Map, Unmap and TrackContinuity change the reverse map exclusively; guest writes to
+    /// pages with several device aliases only read it (InnerGatherDeviceAddresses), on every
+    /// core at once, so they share it instead of queueing behind each other.
+    std::shared_mutex mapping_guard;
 
 };
 

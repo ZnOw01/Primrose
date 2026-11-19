@@ -2679,6 +2679,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     loading_screen->show();
 
     emulation_running = true;
+    if (Settings::values.fullscreen_on_launch.GetValue()) {
+        ui->action_Fullscreen->setChecked(true);
+    }
     if (ui->action_Fullscreen->isChecked()) {
         ShowFullscreen();
     } else {

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+#include "common/progress_counter.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -247,10 +248,17 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     }
     const auto spin = std::chrono::microseconds{spin_us};
     if (spin.count() > 0) {
+        static constexpr bool idle_pause = true;
+        const KProcess* process = kernel.ApplicationProcess();
+        const bool pause = idle_pause && process != nullptr && process->IsSwitch2();
         const auto deadline = std::chrono::steady_clock::now() + spin;
         while (!m_is_interrupted.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
+            if (pause) {
+                Common::CpuRelax();
+            } else {
+                std::this_thread::yield();
+            }
         }
     }
     std::unique_lock lk{m_guard};

@@ -112,9 +112,8 @@ TEST_CASE("Native full texture unswizzle throughput", "[.native_swizzle_bench]")
                                              shape.block_height, shape.block_depth, 0, true);
         }
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        const char* flag = std::getenv("EDEN_NX2_NATIVE_SWIZZLE_MASKS");
-        std::printf("native_swizzle_bench flag=%s width=%u height=%u depth=%u seconds=%.6f MiB_s=%.2f\n",
-                    flag ? flag : "unset", shape.width, shape.height, shape.depth, seconds,
+        std::printf("native_swizzle_bench width=%u height=%u depth=%u seconds=%.6f MiB_s=%.2f\n",
+                    shape.width, shape.height, shape.depth, seconds,
                     static_cast<double>(linear.size()) * iterations / (1024 * 1024) / seconds);
         REQUIRE(std::all_of(linear.begin(), linear.end(), [](u8 byte) { return byte == 0x7b; }));
     }

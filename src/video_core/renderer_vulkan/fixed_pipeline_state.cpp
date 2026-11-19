@@ -106,6 +106,114 @@ void RefreshXfbState(VideoCommon::TransformFeedbackState& state, const Maxwell& 
 }
 } // Anonymous namespace
 
+void FixedPipelineState::SetupDirtyRegisters(Tegra::Engines::Maxwell3D& maxwell3d,
+                                            const DynamicFeatures& features) {
+    using Maxwell3D = Tegra::Engines::Maxwell3D;
+    auto& registers = maxwell3d.dirty.pipeline_state_registers;
+    registers.reset();
+    const auto track = [&](size_t first, size_t count) {
+        for (size_t index = first; index < first + count; ++index) {
+            registers[index] = true;
+        }
+    };
+#define TRACK(field) track(MAXWELL3D_REG_INDEX(field), sizeof(Maxwell::field) / (sizeof(u32)))
+    TRACK(transform_feedback_enabled);
+    TRACK(depth_mode);
+    TRACK(polygon_mode_front);
+    TRACK(tessellation.params);
+    TRACK(patch_vertices);
+    TRACK(anti_alias_samples_mode);
+    TRACK(alpha_test_enabled);
+    TRACK(alpha_test_func);
+    TRACK(alpha_test_ref);
+    TRACK(mandated_early_z);
+    TRACK(zeta_enable);
+    TRACK(zeta.format);
+    TRACK(window_origin);
+    TRACK(provoking_vertex);
+    TRACK(conservative_raster_enable);
+    TRACK(line_anti_alias_enable);
+    TRACK(anti_alias_alpha_control);
+    TRACK(depth_bounds);
+    TRACK(line_stipple_params);
+    TRACK(point_size);
+    TRACK(vertex_attrib_format);
+    // Dual-source blending is part of the key even with dynamic blending.
+    TRACK(blend);
+    TRACK(blend_per_target_enabled);
+    TRACK(blend_per_target);
+    TRACK(iterated_blend);
+    for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
+        track(MAXWELL3D_REG_INDEX(rt) +
+                  (index * sizeof(Maxwell::RenderTargetConfig) +
+                   offsetof(Maxwell::RenderTargetConfig, format)) / sizeof(u32),
+              1);
+    }
+    for (size_t index = 0; index < Maxwell::NumViewports; ++index) {
+        track(MAXWELL3D_REG_INDEX(viewport_transform) +
+                  (index * sizeof(Maxwell::ViewportTransform) +
+                   offsetof(Maxwell::ViewportTransform, swizzle)) / sizeof(u32),
+              1);
+    }
+    if (!features.has_dynamic_vertex_input || !features.has_extended_dynamic_state ||
+        features.has_static_vertex_repack) {
+        for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
+            track(MAXWELL3D_REG_INDEX(vertex_streams) +
+                      index * sizeof(Maxwell::VertexStream) / sizeof(u32),
+                  1);
+        }
+    }
+    if (!features.has_dynamic_vertex_input) {
+        TRACK(vertex_stream_instances);
+        for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
+            track(MAXWELL3D_REG_INDEX(vertex_streams) +
+                      (index * sizeof(Maxwell::VertexStream) +
+                       offsetof(Maxwell::VertexStream, frequency)) / sizeof(u32),
+                  1);
+        }
+    }
+    if (!features.has_extended_dynamic_state) {
+        TRACK(stencil_front_op);
+        TRACK(stencil_back_op);
+        TRACK(stencil_two_side_enable);
+        TRACK(stencil_enable);
+        TRACK(depth_write_enabled);
+        TRACK(depth_bounds_enable);
+        TRACK(depth_test_enable);
+        TRACK(gl_front_face);
+        TRACK(depth_test_func);
+        TRACK(gl_cull_face);
+        TRACK(gl_cull_test_enabled);
+    }
+    if (!features.has_extended_dynamic_state_2_logic_op) {
+        TRACK(logic_op.op);
+        if (!features.has_extended_dynamic_state_2) {
+            TRACK(rasterize_enable);
+            TRACK(primitive_restart.enabled);
+            TRACK(polygon_offset_point_enable);
+            TRACK(polygon_offset_line_enable);
+            TRACK(polygon_offset_fill_enable);
+        }
+    }
+    if (!features.has_extended_dynamic_state_3_blend) {
+        TRACK(color_mask_common);
+        TRACK(color_mask);
+    }
+    if (!features.has_dynamic_state3_logic_op_enable) {
+        TRACK(logic_op.enable);
+    }
+    if (!features.has_dynamic_state3_depth_clamp_enable) {
+        TRACK(viewport_clip_control);
+    }
+    if (!features.has_dynamic_state3_line_stipple_enable) {
+        TRACK(line_stipple_enable);
+    }
+    TRACK(transform_feedback.controls);
+    TRACK(stream_out_layout);
+#undef TRACK
+    maxwell3d.dirty.pipeline_state_dirty = true;
+}
+
 void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features) {
     const Maxwell& regs = maxwell3d.regs;
     const auto topology_ = maxwell3d.draw_manager.draw_state.topology;

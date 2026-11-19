@@ -13,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -26,6 +27,7 @@
 #include "common/progress_counter.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_gpu_side.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -50,6 +52,7 @@ struct QueryCacheParams;
 /// OpenGL-like operations on Vulkan command buffers.
 class Scheduler {
 public:
+
     explicit Scheduler(const Device& device, StateTracker& state_tracker);
     ~Scheduler();
 
@@ -64,6 +67,8 @@ public:
     /// once); otherwise it goes with the next one. The back submits deferred work before it
     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
     bool DeferFlush();
+    /// Coalesce short list-copy bursts; demanded copies are submitted by WaitSubmitted.
+    bool DeferListCopyFlush();
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
@@ -238,6 +243,7 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
+        commands_pending = true;
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
@@ -307,10 +313,44 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
     void Record(T&& c) {
+        commands_pending = true;
+        static constexpr bool direct_command = true;
+        if (direct_command) {
+            if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+                VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+            }
+            if (uploads_pending) {
+                FlushUploads();
+            }
+            if (chunk->Record<true>(c)) {
+                return;
+            }
+            DispatchWork();
+            (void)chunk->Record<true>(c);
+            return;
+        }
         this->RecordWithUploadBuffer(
             [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
                 command(cmdbuf);
             });
+    }
+
+    /// State commands do not access buffer contents; pending copies may follow them.
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordState(T&& command) {
+        commands_pending = true;
+        if (!VideoCommon::Nx2GpuSide::On(VideoCommon::Nx2GpuSide::Opt::CopyBatch)) {
+            Record(std::forward<T>(command));
+            return;
+        }
+        if (VideoCommon::GpuSplit::check_owner) {
+            VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordState");
+        }
+        if (!chunk->Record<true>(command)) {
+            DispatchWork();
+            (void)chunk->Record<true>(command);
+        }
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -390,6 +430,7 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    bool commands_pending{};
     /// The master semaphore's current tick as of the last submission (WaitSubmitted waits on it).
     Common::ProgressCounter submitted_ticks;
 
@@ -411,7 +452,7 @@ private:
         Command* next = nullptr;
     };
 
-    template <typename T>
+    template <typename T, bool SingleBuffer>
     class TypedCommand final : public Command {
     public:
         explicit TypedCommand(T&& command_) : command{std::move(command_)} {}
@@ -422,7 +463,11 @@ private:
 
         void Execute(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) const override {
 
-            command(cmdbuf, upload_cmdbuf);
+            if constexpr (SingleBuffer) {
+                command(cmdbuf);
+            } else {
+                command(cmdbuf, upload_cmdbuf);
+            }
         }
 
     private:
@@ -433,9 +478,9 @@ private:
     public:
         void ExecuteAll(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf);
 
-        template <typename T>
+        template <bool SingleBuffer = false, typename T>
         bool Record(T& command) {
-            using FuncType = TypedCommand<T>;
+            using FuncType = TypedCommand<T, SingleBuffer>;
             static_assert(sizeof(FuncType) < sizeof(data), "Lambda is too large");
 
             command_offset = Common::AlignUp(command_offset, alignof(FuncType));
@@ -544,6 +589,8 @@ private:
     StateTracker& state_tracker;
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
+
+private:
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
     bool storage_writes_unordered{};

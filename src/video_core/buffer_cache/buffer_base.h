@@ -103,6 +103,10 @@ public:
 
     DAddr cpu_addr_cached = 0;
 
+    u64 upload_clean_epoch{};
+    DAddr upload_clean_begin{};
+    DAddr upload_clean_end{};
+
     /// Returns the offset relative to the given CPU address
     /// @pre IsInBounds returns true
     [[nodiscard]] u32 Offset(VAddr other_cpu_addr) const noexcept {

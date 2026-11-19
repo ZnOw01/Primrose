@@ -11,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #if defined(ARCHITECTURE_x86_64)
 #include <immintrin.h>
@@ -140,7 +141,10 @@ void PendingWakeSleep(PendingWakeStats& stats, u64 push_seen, u64 latch_seen) {
     const bool skipped = reason != 0;
     bool woke = skipped;
     if (!skipped) {
-        woke = Wake::wake_event.WaitFor(std::chrono::milliseconds{1});
+        static constexpr bool short_wait = true;
+        // Plain guest CPU stores do not signal wake_event.
+        const auto timeout = std::chrono::microseconds{short_wait ? 100 : 1000};
+        woke = Wake::wake_event.WaitFor(timeout);
         reason = woke ? Wake::wake_reasons.load(std::memory_order_relaxed) : 0;
     }
     Wake::front_sleeping.store(false, std::memory_order_seq_cst);
@@ -268,13 +272,18 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     if (VideoCommon::Nx2Hazard::Enabled()) {
                         split.Defer([epoch = submit_list->epoch] {
                             VideoCommon::Nx2Hazard::SetListEpoch(epoch);
-                        });
+                        }, VideoCommon::GpuSplit::AcquireKnownReleaseEnabled()
+                               ? VideoCommon::GpuSplit::Effect::None
+                               : VideoCommon::GpuSplit::Effect::Unknown);
                     }
                     const u64 timeline_seq = submit_list->timeline_seq;
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                     if (timeline_seq != 0) {
                         VideoCommon::Nx2Timeline::OnFront(timeline_seq);
-                        split.Defer([timeline_seq] { VideoCommon::Nx2Timeline::OnBack(timeline_seq); });
+                        split.Defer([timeline_seq] { VideoCommon::Nx2Timeline::OnBack(timeline_seq); },
+                                    VideoCommon::GpuSplit::AcquireKnownReleaseEnabled()
+                                        ? VideoCommon::GpuSplit::Effect::None
+                                        : VideoCommon::GpuSplit::Effect::Unknown);
                     }
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });

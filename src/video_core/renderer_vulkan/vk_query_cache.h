@@ -7,6 +7,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -42,6 +43,12 @@ public:
 
     void Barriers(bool is_prebarrier);
 
+    void InvalidateHostQuery(DAddr address);
+    bool TryReadHostQuery(DAddr address, std::span<u8> value);
+    bool MergeHostQueryWaits() const;
+    std::optional<u64> HostQueryWaitTick(DAddr address) const;
+    void WaitHostQueryTick(u64 tick);
+
     void EndHostConditionalRendering();
 
     void PauseHostConditionalRendering();
@@ -70,6 +77,7 @@ private:
 };
 
 struct QueryCacheParams {
+    static constexpr bool HAS_HOST_QUERY_READBACK = true;
     using RuntimeType = typename Vulkan::QueryCacheRuntime;
 };
 

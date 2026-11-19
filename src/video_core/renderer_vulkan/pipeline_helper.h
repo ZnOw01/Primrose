@@ -482,21 +482,39 @@ public:
     std::array<f32, 4> words{};
 };
 
+template <bool HasTextureBuffers = true, bool HasImageBuffers = true, bool HasImages = true>
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
                                  const VideoCommon::ImageViewInOut*& views) {
-    const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
-    const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
-    views += num_texture_buffers;
-    views += num_image_buffers;
+    if constexpr (HasTextureBuffers) {
+        views += Shader::NumDescriptors(info.texture_buffer_descriptors);
+    }
+    if constexpr (HasImageBuffers) {
+        views += Shader::NumDescriptors(info.image_buffer_descriptors);
+    }
     const bool rescaling_active{Settings::values.resolution_info.active};
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
+        // Dynamically indexed bindless tables are sized to the most a constant buffer could hold
+        // (1024 entries; Welcome Tour binds two or three per pipeline) and are mostly zero
+        // handles, which resolve to the same view and sampler over and over. An entry equal to
+        // the previous one of this array gets the same descriptor: skip the view, sampler-variant
+        // and rescaling lookups (~85% of the entries there).
+        VideoCommon::ImageViewId previous_view_id{};
+        VideoCommon::SamplerId previous_sampler_id{};
+        VkImageView previous_vk_view{VK_NULL_HANDLE};
+        VkSampler previous_vk_sampler{VK_NULL_HANDLE};
+        bool has_previous{};
         for (u32 index = 0; index < desc.count; ++index) {
             const VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            if (has_previous && image_view_id == previous_view_id &&
+                sampler_id == previous_sampler_id) {
+                guest_descriptor_queue.AddSampledImage(previous_vk_view, previous_vk_sampler);
+                continue;
+            }
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
             if (vk_image_view == VK_NULL_HANDLE) {
@@ -504,28 +522,35 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
-            guest_descriptor_queue.AddSampledImage(vk_image_view,
-                                                   sampler.HandleFor(image_view, desc.is_depth));
+            const VkSampler vk_sampler{sampler.HandleFor(image_view, desc.is_depth)};
+            guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
             if (rescaling_active) {
                 is_rescaled |= texture_cache.IsRescaling(image_view);
             }
+            previous_view_id = image_view_id;
+            previous_sampler_id = sampler_id;
+            previous_vk_view = vk_image_view;
+            previous_vk_sampler = vk_sampler;
+            has_previous = true;
         }
         rescaling.PushTexture(is_rescaled);
     }
-    for (const auto& desc : info.image_descriptors) {
-        bool is_rescaled{};
-        for (u32 index = 0; index < desc.count; ++index) {
-            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
-            if (desc.is_written) {
-                texture_cache.MarkModification(image_view.image_id);
+    if constexpr (HasImages) {
+        for (const auto& desc : info.image_descriptors) {
+            bool is_rescaled{};
+            for (u32 index = 0; index < desc.count; ++index) {
+                ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+                if (desc.is_written) {
+                    texture_cache.MarkModification(image_view.image_id);
+                }
+                const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
+                guest_descriptor_queue.AddImage(vk_image_view);
+                if (rescaling_active) {
+                    is_rescaled |= texture_cache.IsRescaling(image_view);
+                }
             }
-            const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
-            guest_descriptor_queue.AddImage(vk_image_view);
-            if (rescaling_active) {
-                is_rescaled |= texture_cache.IsRescaling(image_view);
-            }
+            rescaling.PushImage(is_rescaled);
         }
-        rescaling.PushImage(is_rescaled);
     }
 }
 

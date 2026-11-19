@@ -76,6 +76,7 @@ public:
     void TickFrame();
 
     [[nodiscard]] vk::Image AcquireImageAllocation(const VideoCommon::ImageInfo& info);
+    [[nodiscard]] vk::Image AcquireScaledImageAllocation(const VideoCommon::ImageInfo& scaled_info);
     void RecycleImage(Image& image, u64 completed_tick);
     bool CanGpuUnswizzle(const Image& image) const;
     bool UploadGpuUnswizzle(Image& image, std::span<const u8> source);
@@ -303,20 +304,7 @@ public:
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     std::optional<PlainUnswizzlePass> plain_unswizzle_pass;
     VkBuffer DispatchPlainUnswizzle(const VideoCommon::PlainUnswizzleParameters& parameters,
-                                   const StagingBufferRef& source, bool guarded);
-    bool CheckPlainUnswizzle(const VideoCommon::ImageInfo& info,
-                            const VideoCommon::PlainUnswizzleParameters& parameters,
-                            const StagingBufferRef& source, VkBuffer output);
-    StagingBufferRef QueuePlainUnswizzleReadback(
-        const VideoCommon::PlainUnswizzleParameters& parameters, VkBuffer output, bool deferred);
-    bool TestPlainUnswizzle();
-    bool plain_unswizzle_tested{};
-    bool plain_unswizzle_failed{};
-    u64 plain_unswizzle_frames{};
-    u64 plain_unswizzle_uploads{};
-    u64 plain_unswizzle_bytes{};
-    u32 plain_verified_early{};
-    u32 plain_verified_late{};
+                                   const StagingBufferRef& source);
     const Settings::ResolutionScalingInfo& resolution;
     std::array<std::vector<VkFormat>, VideoCore::Surface::MaxPixelFormat> view_formats;
 
@@ -344,16 +332,8 @@ public:
     };
 
     std::vector<MsaaScratchImage> msaa_scratch_images;
-    /// EDEN_NX2_IMAGE_POOL_MIB / EDEN_NX2_IMAGE_POOL_ENTRIES: what the pool may hold (256, 128).
-    /// Ocarina of Time recreates ~15 render targets a frame while the view moves (up to 29 MiB
-    /// each): 256 MiB evicted about half of what it recycled.
-    static u64 PoolSetting(const char* name, u64 fallback) {
-        const char* value = std::getenv(name);
-        return value != nullptr ? std::strtoull(value, nullptr, 10) : fallback;
-    }
     VideoCommon::ImageAllocationPool<vk::Image> image_allocation_pool{
-        PoolSetting("EDEN_NX2_IMAGE_POOL_MIB", 256) << 20,
-        static_cast<size_t>(PoolSetting("EDEN_NX2_IMAGE_POOL_ENTRIES", 128)), 3600};
+        u64{256} << 20, 128, 3600};
     u64 allocation_pool_frames{};
     u32 allocation_pool_pressure_events{};
     u32 allocation_pool_pressure_frames{};
@@ -874,6 +854,19 @@ private:
 
         bool operator==(const VariantKey&) const noexcept = default;
 
+        [[nodiscard]] u32 Code() const noexcept {
+            static_assert(VK_COMPONENT_SWIZZLE_A == 6);
+            return static_cast<u32>(reduce_anisotropy) |
+                   (static_cast<u32>(force_nearest) << 1) |
+                   (static_cast<u32>(drop_reduction) << 2) |
+                   (static_cast<u32>(drop_custom_border) << 3) |
+                   (static_cast<u32>(srgb_border) << 4) |
+                   (static_cast<u32>(swizzle[0]) << 5) |
+                   (static_cast<u32>(swizzle[1]) << 8) |
+                   (static_cast<u32>(swizzle[2]) << 11) |
+                   (static_cast<u32>(swizzle[3]) << 14);
+        }
+
         [[nodiscard]] bool HasSwizzle() const noexcept {
             return swizzle != std::array<VkComponentSwizzle, 4>{};
         }
@@ -881,6 +874,7 @@ private:
 
     struct Variant {
         VariantKey key;
+        u32 code;
         vk::Sampler sampler;
     };
 

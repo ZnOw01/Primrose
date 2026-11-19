@@ -2628,11 +2628,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool depth_compare = insn.Bits(78, 1);
             const u32 dimension = insn.Bits(61, 3), lod = insn.Bits(87, 3);
             const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
-            if (!bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1) {
-                if (!insn.Bits(60, 1) || insn.Bits(76, 2) || insn.Bits(81, 3) != 7 ||
-                    insn.Bits(59, 1) || insn.Bits(40, 14) > 0x1fff || insn.Bits(54, 5) != 2 ||
-                    (source_a & 1) || (source_b & 1) || source_a >= 248 || source_b >= 248 || dest >= 248)
-                    return fail(index, "native array depth comparison sample mode");
+            // Depth-compared 2D array sample from descriptor buffer 2 as one Maxwell TEX. Other
+            // forms (Welcome Tour's shadow maps read descriptor buffer 4) take the general path
+            // below, which reads other buffers bindless; they were rejected here before.
+            if (!bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1 &&
+                insn.Bits(60, 1) && !insn.Bits(76, 2) && insn.Bits(81, 3) == 7 &&
+                !insn.Bits(59, 1) && insn.Bits(40, 14) <= 0x1fff && insn.Bits(54, 5) == 2 &&
+                !(source_a & 1) && !(source_b & 1) && source_a < 248 && source_b < 248 && dest < 248) {
                 if (!bind_texture_buffer(2)) return fail(index, "native texture descriptor buffer conflict");
                 for (u32 i = 0; i < 3; ++i) {
                     const u32 source = i < 2 ? source_a + i : source_b;

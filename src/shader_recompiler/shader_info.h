@@ -237,10 +237,24 @@ struct TextureDescriptor {
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word above.
     u32 handle_program{~0U};
+    /// Bytes between the handles of an array's elements when nonzero, instead of
+    /// 1 << size_shift (a set-bit indexed table, see ConstBufferAddr::element_stride).
+    u32 element_stride{};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
 using TextureDescriptors = boost::container::small_vector<TextureDescriptor, 12>;
+
+/// Byte offset of element `index` of a descriptor array from its cbuf_offset.
+template <typename Descriptor>
+[[nodiscard]] constexpr u32 DescriptorElementOffset(const Descriptor& desc, u32 index) {
+    if constexpr (requires { desc.element_stride; }) {
+        if (desc.element_stride != 0) {
+            return index * desc.element_stride;
+        }
+    }
+    return index << desc.size_shift;
+}
 
 struct ImageDescriptor {
     TextureType type;
@@ -417,7 +431,6 @@ u32 NumDescriptors(const Descriptors& descriptors) {
     }
     return num;
 }
-
 
 /// Operations of a handle program, a stack machine over 32-bit words. Operands follow the
 /// operation code in the program; values are popped right operand first.

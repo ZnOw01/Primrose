@@ -98,6 +98,113 @@ constexpr u32 DESCRIPTOR_SIZE = 8;
 constexpr u32 DESCRIPTOR_SIZE_SHIFT = u32(std::countr_zero(DESCRIPTOR_SIZE));
 constexpr u32 DESCRIPTOR_MAX_COUNT = 1024;
 
+/// Matches a dynamic cbuf offset of FindUMsb32(mask) * stride (+ add), the shape of a loop over
+/// the set bits of a mask (i = msb(mask); mask ^= 1 << i), as Welcome Tour's lighting does over
+/// 192- and 304-byte records. The product may be lowered to 16-bit halves:
+/// ((hi16(m) * C) << 16) + (lo16(m) * C + add). Only 32 elements can be reached.
+bool MatchSetBitIndex(const IR::U32& dynamic_offset, IR::U32& msb, u32& stride, u32& add) {
+    const auto is_msb = [](const IR::Value& v) {
+        return !v.IsImmediate() && v.InstRecursive()->GetOpcode() == IR::Opcode::FindUMsb32;
+    };
+    const auto mul_by_imm = [](const IR::Value& v, IR::Value& factor, u32& c) {
+        if (v.IsImmediate()) {
+            return false;
+        }
+        const IR::Inst* const inst{v.InstRecursive()};
+        if (inst->GetOpcode() != IR::Opcode::IMul32) {
+            return false;
+        }
+        if (inst->Arg(1).IsImmediate()) {
+            factor = inst->Arg(0);
+            c = inst->Arg(1).U32();
+            return true;
+        }
+        if (inst->Arg(0).IsImmediate()) {
+            factor = inst->Arg(1);
+            c = inst->Arg(0).U32();
+            return true;
+        }
+        return false;
+    };
+    const auto ubfe_of = [](const IR::Value& v, u32 offset, u32 count) -> IR::Inst* {
+        if (v.IsImmediate()) {
+            return nullptr;
+        }
+        const IR::Inst* const inst{v.InstRecursive()};
+        if (inst->GetOpcode() != IR::Opcode::BitFieldUExtract || !inst->Arg(1).IsImmediate() ||
+            !inst->Arg(2).IsImmediate() || inst->Arg(1).U32() != offset ||
+            inst->Arg(2).U32() != count || inst->Arg(0).IsImmediate()) {
+            return nullptr;
+        }
+        return inst->Arg(0).InstRecursive();
+    };
+    IR::Value factor;
+    u32 c{};
+    if (mul_by_imm(dynamic_offset, factor, c) && is_msb(factor)) {
+        msb = IR::U32{factor};
+        stride = c;
+        add = 0;
+        return c != 0 && c % 4 == 0;
+    }
+    if (dynamic_offset.IsImmediate()) {
+        return false;
+    }
+    const IR::Inst* const sum{dynamic_offset.InstRecursive()};
+    if (sum->GetOpcode() != IR::Opcode::IAdd32) {
+        return false;
+    }
+    for (size_t order = 0; order < 2; ++order) {
+        const IR::Value high_part{sum->Arg(order)};
+        const IR::Value low_part{sum->Arg(1 - order)};
+        // (hi16(m) * C) << 16
+        if (high_part.IsImmediate()) {
+            continue;
+        }
+        const IR::Inst* const shl{high_part.InstRecursive()};
+        if (shl->GetOpcode() != IR::Opcode::ShiftLeftLogical32 || !shl->Arg(1).IsImmediate() ||
+            shl->Arg(1).U32() != 16) {
+            continue;
+        }
+        IR::Value hi_factor;
+        u32 hi_c{};
+        if (!mul_by_imm(shl->Arg(0), hi_factor, hi_c)) {
+            continue;
+        }
+        IR::Inst* const hi_src{ubfe_of(hi_factor, 16, 16)};
+        // lo16(m) * C + add, or lo16(m) * C
+        IR::Value lo_mul{low_part};
+        u32 lo_add{};
+        if (!low_part.IsImmediate() &&
+            low_part.InstRecursive()->GetOpcode() == IR::Opcode::IAdd32) {
+            const IR::Inst* const add_inst{low_part.InstRecursive()};
+            if (add_inst->Arg(1).IsImmediate()) {
+                lo_mul = add_inst->Arg(0);
+                lo_add = add_inst->Arg(1).U32();
+            } else if (add_inst->Arg(0).IsImmediate()) {
+                lo_mul = add_inst->Arg(1);
+                lo_add = add_inst->Arg(0).U32();
+            } else {
+                continue;
+            }
+        }
+        IR::Value lo_factor;
+        u32 lo_c{};
+        if (!mul_by_imm(lo_mul, lo_factor, lo_c)) {
+            continue;
+        }
+        IR::Inst* const lo_src{ubfe_of(lo_factor, 0, 16)};
+        if (hi_src == nullptr || hi_src != lo_src || hi_c != lo_c || hi_c == 0 || hi_c % 4 != 0 ||
+            hi_src->GetOpcode() != IR::Opcode::FindUMsb32) {
+            continue;
+        }
+        msb = IR::U32{IR::Value{hi_src}};
+        stride = hi_c;
+        add = lo_add;
+        return true;
+    }
+    return false;
+}
+
 u32 DynamicDescriptorSizeShift(const IR::U32& dynamic_offset) {
     const IR::Inst* const inst = dynamic_offset.InstRecursive();
     if (!inst || inst->GetOpcode() != IR::Opcode::ShiftLeftLogical32)
@@ -366,7 +473,6 @@ static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
     if (cbuf.handle_program != ~0U) return false;
     return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
 }
-
 
 std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block);
 static inline std::optional<ConstBufferAddr> TrackCached(const IR::Value& v, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
@@ -907,6 +1013,15 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         return std::nullopt;
     }
     auto const size_shift = DynamicDescriptorSizeShift(dynamic_offset);
+    IR::U32 element_index{};
+    u32 element_stride{};
+    u32 element_add{};
+    static const bool set_bit_arrays{Common::EnvGate("EDEN_NX2_SET_BIT_ARRAYS")};
+    if (!set_bit_arrays ||
+        !MatchSetBitIndex(dynamic_offset, element_index, element_stride, element_add)) {
+        element_stride = 0;
+        element_add = 0;
+    }
     auto const sampled_limit = (std::max)(1U, (std::min)(host_info.max_per_stage_descriptor_sampled_images,
                                                          host_info.max_descriptor_set_sampled_images));
     auto const resource_limit = (std::max)(1U, host_info.max_per_stage_resources);
@@ -920,6 +1035,9 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         .dynamic_offset = dynamic_offset,
         .count = DynamicDescriptorCount(base_offset, size_shift, (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit, resource_limit})),
         .has_secondary = false,
+        .element_index = element_index,
+        .element_offset = base_offset + element_add,
+        .element_stride = element_stride,
     };
 }
 
@@ -1056,7 +1174,8 @@ public:
                    desc.secondary_cbuf_offset == existing.secondary_cbuf_offset &&
                    desc.secondary_shift_left == existing.secondary_shift_left &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
-                   desc.handle_program == existing.handle_program;
+                   desc.handle_program == existing.handle_program &&
+                   desc.element_stride == existing.element_stride;
         })};
         // TODO: Read this from TIC
         texture_descriptors[index].is_multisample |= desc.is_multisample;
@@ -1268,6 +1387,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             break;
         }
         u32 index;
+        bool set_bit_form{}; // sampled set-bit table (ConstBufferAddr::element_stride)
         u32 size_shift = cbuf.count > 1 ? DynamicDescriptorSizeShift(cbuf.dynamic_offset) : DESCRIPTOR_SIZE_SHIFT;
         u32 count = cbuf.count;
         switch (inst->GetOpcode()) {
@@ -1333,6 +1453,11 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .handle_program = cbuf.handle_program,
                 });
             } else {
+                if (cbuf.element_stride != 0) {
+                    // Set-bit indexed table: 32 elements element_stride bytes apart.
+                    set_bit_form = true;
+                    count = 32;
+                }
                 count = std::min(count, sampled_dynamic_cap);
                 // Depth-compare sampling returns a float in Vulkan, so its image must be float
                 // even when a garbage or unknown descriptor reads as an integer format.
@@ -1346,7 +1471,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .is_integer = is_integer,
                     .has_secondary = cbuf.has_secondary,
                     .cbuf_index = cbuf.index,
-                    .cbuf_offset = cbuf.offset,
+                    .cbuf_offset = set_bit_form ? cbuf.element_offset : cbuf.offset,
                     .shift_left = cbuf.shift_left,
                     .secondary_cbuf_index = cbuf.secondary_index,
                     .secondary_cbuf_offset = cbuf.secondary_offset,
@@ -1354,6 +1479,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .count = count,
                     .size_shift = size_shift,
                     .handle_program = cbuf.handle_program,
+                    .element_stride = set_bit_form ? cbuf.element_stride : 0,
                 });
                 flags.is_integer.Assign(is_integer ? 1 : 0);
             }
@@ -1365,8 +1491,14 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         if (count > 1) {
             const auto insert_point{IR::Block::InstructionList::s_iterator_to(*inst)};
             IR::IREmitter ir{*texture_inst.block, insert_point};
-            const IR::U32 shift{ir.Imm32(size_shift)};
-            inst->SetArg(0, ir.UMin(ir.ShiftRightLogical(cbuf.dynamic_offset, shift), ir.Imm32(count - 1)));
+            if (set_bit_form) {
+                // The set bit's index. FindUMsb32 of an empty mask (-1, which the loop never
+                // reaches) clamps to the last element.
+                inst->SetArg(0, ir.UMin(cbuf.element_index, ir.Imm32(count - 1)));
+            } else {
+                const IR::U32 shift{ir.Imm32(size_shift)};
+                inst->SetArg(0, ir.UMin(ir.ShiftRightLogical(cbuf.dynamic_offset, shift), ir.Imm32(count - 1)));
+            }
         } else {
             inst->SetArg(0, IR::Value{});
         }

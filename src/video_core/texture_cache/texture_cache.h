@@ -191,14 +191,7 @@ void TextureCache<P>::RunGarbageCollector() {
             return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
         }();
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
-        // EDEN_NX2_TC_GC_ITERATIONS=<n>: images a normal pass may delete (10). Ocarina of Time
-        // makes ~11 render targets a frame at shifting offsets of a transient heap while the
-        // view moves: 10 a frame never kept up, memory grew until the collector thrashed.
-        static const size_t normal_iterations = [] {
-            const char* value = std::getenv("EDEN_NX2_TC_GC_ITERATIONS");
-            return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
-                                    : size_t{10};
-        }();
+        static constexpr size_t normal_iterations = 10;
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : normal_iterations);
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
@@ -297,13 +290,7 @@ void TextureCache<P>::RunGarbageCollector() {
         }
     };
     Configure(false);
-    // EDEN_NX2_TC_STALE_AGE=<frames>: images newer images partly overwrote (BadOverlap: never
-    // downloaded, their bytes belong to the newer ones) are collected once idle this long, before
-    // the age-based pass, up to 64 a frame. Off by default.
-    static const u64 stale_age = [] {
-        const char* value = std::getenv("EDEN_NX2_TC_STALE_AGE");
-        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
-    }();
+    static constexpr u64 stale_age = 30;
     if (stale_age != 0 && frame_tick > stale_age) {
         const size_t saved_iterations = num_iterations;
         num_iterations = 64;
@@ -313,10 +300,7 @@ void TextureCache<P>::RunGarbageCollector() {
                 True(image.flags & ImageFlagBits::CostlyLoad)) {
                 return false;
             }
-            const u64 before = gc_deletes;
-            const bool stop = Cleanup(image_id);
-            stale_deletes += gc_deletes - before;
-            return stop;
+            return Cleanup(image_id);
         });
         num_iterations = saved_iterations;
     }
@@ -929,7 +913,7 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
         return NULL_SAMPLER_ID;
     }
     VideoCommon::Nx2DrawStats::Timer probe{VideoCommon::Nx2DrawStats::Site::SamplerLookup};
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    auto const [descriptor, is_new] = table.ReadReference(*gpu_memory, index, !compute);
     probe.hit = !is_new;
     if (is_new) {
         auto const id = FindSampler(descriptor, compute);
@@ -1230,10 +1214,50 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         return NULL_IMAGE_VIEW_ID;
     }
     VideoCommon::Nx2DrawStats::Timer probe{VideoCommon::Nx2DrawStats::Site::ImageViewLookup};
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    auto const [descriptor, is_new] = table.ReadReference(*gpu_memory, index, !compute);
     probe.hit = !is_new;
     if (is_new) {
-        if (IsValidEntry(*gpu_memory, descriptor)) {
+        static constexpr bool reuse_resolved = true;
+        const bool cache_resolution = reuse_resolved && !compute;
+        const size_t resolved_memory = cache_resolution ? gpu_memory->GetID() : 0;
+        const u64 resolved_map = cache_resolution ? gpu_memory->GetMapSerial() : 0;
+        TextureCacheChannelInfo::ResolvedImageEntry* resolved = nullptr;
+        if (cache_resolution) {
+            const u64 mixed = descriptor.raw[0] ^ (descriptor.raw[1] >> 5) ^
+                              (descriptor.raw[2] >> 17) ^ descriptor.raw[3];
+            const size_t slot = (mixed ^ (mixed >> 32)) & 255;
+            resolved = &channel_state->resolved_image_entries[slot];
+            if (resolved->id && resolved->memory_id == resolved_memory &&
+                resolved->map_serial == resolved_map && resolved->raw[0] == descriptor.raw[0] &&
+                resolved->raw[1] == descriptor.raw[1] && resolved->raw[2] == descriptor.raw[2] &&
+                resolved->raw[3] == descriptor.raw[3]) {
+                const ImageViewId id = resolved->id;
+                PrepareImageView(id, false, false);
+                table.bound_ids[index] = id;
+                return id;
+            }
+        }
+        const bool valid_entry = [&] {
+            static constexpr bool reuse_validity = true;
+            if (!reuse_validity || compute) {
+                return IsValidEntry(*gpu_memory, descriptor);
+            }
+            const size_t slot = ((descriptor.raw[1] >> 5) ^ descriptor.raw[2]) & 63;
+            auto& cached = channel_state->valid_image_entries[slot];
+            const size_t memory_id = gpu_memory->GetID();
+            const u64 map_serial = gpu_memory->GetMapSerial();
+            if (cached.valid && cached.memory_id == memory_id && cached.map_serial == map_serial &&
+                cached.raw[0] == descriptor.raw[0] && cached.raw[1] == descriptor.raw[1] &&
+                cached.raw[2] == descriptor.raw[2] && cached.raw[3] == descriptor.raw[3]) {
+                return true;
+            }
+            const bool valid = IsValidEntry(*gpu_memory, descriptor);
+            if (valid) {
+                cached = {descriptor.raw, memory_id, map_serial, true};
+            }
+            return valid;
+        }();
+        if (valid_entry) {
             const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
             if (is_new_tc) {
                 pair->second = CreateImageView(descriptor);
@@ -1241,6 +1265,9 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
                     image_view_descriptors[pair->second].emplace_back(current_channel_id,
                                                                       descriptor);
                 }
+            }
+            if (resolved != nullptr && pair->second != NULL_IMAGE_VIEW_ID) {
+                *resolved = {descriptor.raw, resolved_memory, resolved_map, pair->second};
             }
             PrepareImageView(pair->second, false, false);
             table.bound_ids[index] = pair->second;
@@ -2119,7 +2146,9 @@ bool TextureCache<P>::IsRescaling(const ImageViewBase& image_view) const noexcep
         return false;
     }
     const ImageBase& image = slot_images[image_view.image_id];
-    return True(image.flags & ImageFlagBits::Rescaled);
+    static constexpr bool direct_flags = true;
+    return direct_flags ? (static_cast<u32>(image.flags) & static_cast<u32>(ImageFlagBits::Rescaled)) != 0
+                        : True(image.flags & ImageFlagBits::Rescaled);
 }
 
 template <class P>
@@ -2763,13 +2792,6 @@ ImageId TextureCache<P>::FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_a
 template <class P>
 ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                    RelaxedOptions options) {
-    static const bool native_stride = [] {
-        const char* value = std::getenv("EDEN_NX2_TC_NATIVE_STRIDE");
-        return value != nullptr && value[0] == '1';
-    }();
-    if (native_stride && gpu_memory->UsesNativeTiling()) {
-        options |= RelaxedOptions::SingleLayerStride;
-    }
     const std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {
         return ImageId{};
@@ -3570,16 +3592,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             break;
         }
     }
-    // EDEN_NX2_TC_SKIP_STALE_UPLOAD=1: a new single-level 2D render target whose guest bytes all
-    // lie under older images the GPU wrote and the CPU did not (never downloaded: guest memory
-    // holds older bytes than a console's memory would) skips uploading those stale bytes. Ocarina
-    // of Time places its targets at shifting offsets of a transient heap while the view moves:
-    // ~10 MB a frame was copied, sent and unswizzled on the GPU right before being drawn over.
     const auto stale_guest_bytes = [&] {
-        static const bool enabled = [] {
-            const char* value = std::getenv("EDEN_NX2_TC_SKIP_STALE_UPLOAD");
-            return value != nullptr && value[0] == '1';
-        }();
+        static constexpr bool enabled = true;
         if (!enabled || False(options & RelaxedOptions::RenderTarget) ||
             !join_copies_to_do.empty() || new_info.type != ImageType::e2D ||
             new_info.resources.levels != 1 || new_info.resources.layers != 1 ||
@@ -3609,7 +3623,6 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         if (covered < end) {
             return false;
         }
-        ++stale_upload_skips;
         return true;
     };
     if (overwritten_by_clear()) {
@@ -3901,10 +3914,7 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
         info.size.depth > 2048 || info.resources.layers <= 0 || info.resources.layers > 2048) {
         return NULL_IMAGE_VIEW_ID;
     }
-    static const bool reuse_attachments = [] {
-        const char* value = std::getenv("EDEN_NX2_TC_ATTACH_REUSE");
-        return value != nullptr && value[0] == '1';
-    }();
+    static constexpr bool reuse_attachments = true;
     const auto& resolution = Settings::values.resolution_info;
     const bool subextent = reuse_attachments && gpu_memory->UsesNativeTiling() &&
                            resolution.up_scale == 1 && resolution.down_shift == 0 &&
@@ -4432,6 +4442,16 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
 
 template <class P>
 void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> removed_views) {
+    static constexpr bool reuse_resolved = true;
+    if (reuse_resolved && !removed_views.empty()) {
+        for (const size_t channel : active_channel_ids) {
+            for (auto& entry : channel_storage[channel].resolved_image_entries) {
+                if (entry.id && std::ranges::find(removed_views, entry.id) != removed_views.end()) {
+                    entry.id = {};
+                }
+            }
+        }
+    }
     for (const ImageViewId removed : removed_views) {
         const auto refs = image_view_descriptors.find(removed);
         if (refs == image_view_descriptors.end()) {
@@ -4541,9 +4561,17 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
     if (True(image.flags & ImageFlagBits::SparseTilesUnmapped)) [[unlikely]] {
         RefreshUnmappedSparseTiles(image, image_id);
     }
+    static constexpr bool direct_flags = true;
     if (!is_modification && !invalidate &&
-        False(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Alias))) [[likely]] {
-        lru_cache.Touch(image.lru_index, frame_tick);
+        (direct_flags
+             ? (static_cast<u32>(image.flags) &
+                static_cast<u32>(ImageFlagBits::CpuModified | ImageFlagBits::Alias)) == 0
+             : False(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Alias)))) [[likely]] {
+        static constexpr bool local_lru_tick = true;
+        if (!local_lru_tick || image.sampled_lru_frame != frame_tick) {
+            lru_cache.Touch(image.lru_index, frame_tick);
+            image.sampled_lru_frame = frame_tick;
+        }
         return;
     }
     if (invalidate) {

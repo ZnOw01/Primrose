@@ -403,8 +403,39 @@ void Config::ReadRendererValues() {
     ReadCategory(Settings::Category::RendererExtensions);
     ReadCategory(Settings::Category::RendererMemory);
     ReadCategory(Settings::Category::RendererDebug);
+    MigrateMeshShaderSetting();
 
     EndGroup();
+}
+
+void Config::MigrateMeshShaderSetting() {
+    // use_mesh_shaders (on/off) became mesh_shader_mode: on maps to Auto, off to the compute
+    // fallback. Only while the file has no mesh_shader_mode yet; the old keys are dropped after.
+    const std::string old_key{"use_mesh_shaders"};
+    const std::string new_key{"mesh_shader_mode"};
+    const std::string section = GetSection();
+    const auto has = [&](const std::string& key) {
+        return config->GetValue(section.c_str(), GetFullKey(key, false).c_str()) != nullptr;
+    };
+    const std::array old_keys{old_key, old_key + "\\default", old_key + "\\use_global"};
+    if (std::ranges::none_of(old_keys, has)) {
+        return;
+    }
+    if (!has(new_key) && !has(new_key + "\\use_global")) {
+        const bool use_global =
+            global || ReadBooleanSetting(old_key + "\\use_global", std::make_optional(true));
+        if (!use_global) {
+            Settings::values.mesh_shader_mode.SetGlobal(false);
+        }
+        if (global || !use_global) {
+            const bool on = ReadBooleanSetting(old_key, std::make_optional(true));
+            Settings::values.mesh_shader_mode.SetValue(
+                on ? Settings::MeshShaderMode::Auto : Settings::MeshShaderMode::ComputeFallback);
+        }
+    }
+    for (const std::string& key : old_keys) {
+        config->Delete(section.c_str(), GetFullKey(key, false).c_str());
+    }
 }
 
 void Config::ReadScreenshotValues() {

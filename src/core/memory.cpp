@@ -961,10 +961,11 @@ struct Memory::Impl {
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
-            // Performance note:
-            // It may not be a good idea to assume accesses are within the same subaddress (i.e same page)
-            // It is often the case the games like to access wildly different addresses. Hence why I propose
-            // we should let the compiler just do it's thing...
+            static constexpr bool skip_untracked_aliases = true;
+            if (skip_untracked_aliases && address != 0 &&
+                !gpu_device_memory->IsAnyPageCached(address, size)) {
+                return;
+            }
             if (current_area.last_address != subaddress) {
                 // Short circuit the need to check for address/size
                 auto const do_collection = (address != 0 && size != 0)

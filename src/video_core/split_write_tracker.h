@@ -6,10 +6,14 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <deque>
+#include <optional>
 
 #include "common/common_types.h"
+#include "video_core/nx2_front_options.h"
 
 namespace VideoCommon {
 
@@ -48,7 +52,13 @@ public:
     /// More pending ranges than this collapse into one unknown write.
     static constexpr size_t MaxWrites = 512;
 
-    void Entry(Effect effect, u64 end) {
+    struct KnownRelease {
+        u64 address;
+        u64 position;
+        u32 value;
+    };
+
+    NX2_FRONT_INLINE void Entry(Effect effect, u64 end) {
         if (effect == Effect::Unknown) {
             unknown = end;
         } else if (effect == Effect::Gpu) {
@@ -78,6 +88,9 @@ public:
         if (begin >= end_address) {
             return;
         }
+        while (!releases.empty() && releases.back().position == end) {
+            releases.pop_back();
+        }
         if (!writes.empty()) {
             PendingWrite& last = writes.back();
             if (begin <= last.end && last.begin <= end_address) {
@@ -98,8 +111,40 @@ public:
         writes.push_back({begin, end_address, end, kind});
     }
 
+    void Release(u64 address, u64 position, u32 value) {
+        if (releases.size() == MaxWrites) {
+            releases.pop_front();
+        }
+        releases.push_back({address, position, value});
+    }
+
+    /// Only a pending, exact word with no later possible writer can supply an acquire.
+    /// The caller checks skipped draw proofs and outstanding deferred results.
+    [[nodiscard]] std::optional<KnownRelease> ReleaseTo(u64 address, u64 consumed,
+                                                       bool writer_set) const {
+        const u64 begin = address & ~u64{0xf};
+        const u64 target = writer_set ? WriterReadTarget(begin, begin + 16)
+                                      : ReadTarget(begin, begin + 16);
+        for (auto it = releases.rbegin(); it != releases.rend(); ++it) {
+            if (it->position <= consumed) {
+                break;
+            }
+            if (it->address == address) {
+                if (target > it->position || unknown >= it->position ||
+                    (!writer_set && gpu > it->position)) {
+                    return std::nullopt;
+                }
+                return *it;
+            }
+        }
+        return std::nullopt;
+    }
+
     /// Drops the writes the back has run (it consumed `consumed` words).
     void Retire(u64 consumed) {
+        while (!releases.empty() && releases.front().position <= consumed) {
+            releases.pop_front();
+        }
         while (!writes.empty() && writes.front().position <= consumed) {
             writes.pop_front();
         }
@@ -167,6 +212,9 @@ public:
         return false;
     }
 
+    [[nodiscard]] u64 LastWriter() const {
+        return writer;
+    }
     [[nodiscard]] u64 LastUnknown() const {
         return unknown;
     }
@@ -175,6 +223,7 @@ public:
     }
     void Reset() {
         writes.clear();
+        releases.clear();
         draw_epochs.clear();
         unknown = 0;
         gpu = 0;
@@ -194,6 +243,7 @@ private:
         u64 epoch;
     };
     std::deque<PendingWrite> writes;
+    std::deque<KnownRelease> releases;
     std::deque<EpochRecord> draw_epochs;
     u64 unknown{};
     u64 gpu{};    ///< Past the newest entry that draws, dispatches or copies (Gpu or Draw)

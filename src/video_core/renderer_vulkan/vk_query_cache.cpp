@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <memory>
@@ -21,6 +22,8 @@
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_gpu_side.h"
 #include "video_core/query_cache/query_cache.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -185,7 +188,6 @@ public:
 
         has_started = true;
     }
-
 
     void PauseCounter() override {
         if (!has_started) {
@@ -460,6 +462,18 @@ private:
         }
     }
 
+    size_t BuildQuery() {
+        static constexpr bool batch_queries = true;
+        if (!batch_queries || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+            return BaseStreamer::BuildQuery();
+        }
+        if (num_reserved_queries == 0) {
+            BaseStreamer::BuildQueryBatch(reserved_queries);
+            num_reserved_queries = reserved_queries.size();
+        }
+        return reserved_queries[--num_reserved_queries];
+    }
+
     void ReserveBank() {
         current_bank_id =
             bank_pool.ReserveBank([this](std::deque<SamplesQueryBank>& queue, size_t index) {
@@ -620,6 +634,8 @@ private:
     bool accumulation_since_last_sync{};
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
+    std::array<size_t, 32> reserved_queries{};
+    size_t num_reserved_queries{};
     std::mutex flush_guard;
     std::optional<QueriesPrefixScanPass> queries_prefix_scan_pass;
 };
@@ -1356,6 +1372,20 @@ struct QueryCacheRuntimeImpl {
     std::vector<size_t> redirect_cache;
     std::vector<std::vector<VkBufferCopy>> copies_setup;
 
+    struct HostQueryBatch {
+        vk::Buffer buffer;
+        u64 tick{};
+        u64 generation{};
+        size_t capacity{};
+    };
+    struct HostQueryCopy {
+        size_t batch;
+        u64 generation;
+        size_t offset;
+    };
+    std::vector<HostQueryBatch> host_query_batches;
+    ::Common::unordered_map<DAddr, HostQueryCopy> host_query_copies;
+
     // Host conditional rendering data
     std::optional<ConditionalRenderingResolvePass> conditional_resolve_pass;
     vk::Buffer hcr_resolve_buffer;
@@ -1583,6 +1613,53 @@ VideoCommon::StreamerInterface* QueryCacheRuntime::GetStreamerInterface(QueryTyp
     }
 }
 
+void QueryCacheRuntime::InvalidateHostQuery(DAddr address) {
+    if (VideoCommon::Nx2GpuSide::On(VideoCommon::Nx2GpuSide::Opt::QueryReadback)) {
+        impl->host_query_copies.erase(address);
+    }
+}
+
+bool QueryCacheRuntime::MergeHostQueryWaits() const {
+    return Nx2Sync::MergeWaits();
+}
+
+std::optional<u64> QueryCacheRuntime::HostQueryWaitTick(DAddr address) const {
+    const auto it = impl->host_query_copies.find(address);
+    if (it == impl->host_query_copies.end()) {
+        return std::nullopt;
+    }
+    const auto& copy = it->second;
+    const auto& batch = impl->host_query_batches[copy.batch];
+    if (batch.generation != copy.generation) {
+        return std::nullopt;
+    }
+    return batch.tick;
+}
+
+void QueryCacheRuntime::WaitHostQueryTick(u64 tick) {
+    if (tick != 0) {
+        impl->scheduler.Wait(tick);
+    }
+}
+
+bool QueryCacheRuntime::TryReadHostQuery(DAddr address, std::span<u8> value) {
+    const auto it = impl->host_query_copies.find(address);
+    if (it == impl->host_query_copies.end() || value.size() > sizeof(u64)) {
+        return false;
+    }
+    const auto& copy = it->second;
+    auto& batch = impl->host_query_batches[copy.batch];
+    if (batch.generation != copy.generation) {
+        return false;
+    }
+    if (!Nx2Sync::MergeWaits() || !impl->scheduler.IsFree(batch.tick)) {
+        impl->scheduler.Wait(batch.tick);
+    }
+    batch.buffer.Invalidate();
+    std::memcpy(value.data(), batch.buffer.Mapped().data() + copy.offset, value.size());
+    return true;
+}
+
 void QueryCacheRuntime::Barriers(bool is_prebarrier) {
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1702,6 +1779,56 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
     }
 
     impl->scheduler.RequestOutsideRenderPassOperationContext();
+    if constexpr (std::is_same_v<SyncValuesType, HostSyncValues>) {
+        if (VideoCommon::Nx2GpuSide::On(VideoCommon::Nx2GpuSide::Opt::QueryReadback)) {
+            size_t slot = 0;
+            for (; slot < impl->host_query_batches.size(); ++slot) {
+                if (impl->scheduler.IsFree(impl->host_query_batches[slot].tick)) {
+                    break;
+                }
+            }
+            // Bounded snapshots; unavailable or superseded copies use the existing fence path.
+            if (slot < 16) {
+                if (slot == impl->host_query_batches.size()) {
+                    impl->host_query_batches.emplace_back();
+                }
+                auto& batch = impl->host_query_batches[slot];
+                const size_t needed = values.size() * sizeof(u64);
+                if (batch.capacity < needed) {
+                    batch.capacity = Common::AlignUp(needed, size_t{4096});
+                    batch.buffer = impl->memory_allocator.CreateBuffer(VkBufferCreateInfo{
+                        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                        .size = batch.capacity,
+                        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    }, MemoryUsage::Download);
+                }
+                batch.tick = impl->scheduler.CurrentTick();
+                ++batch.generation;
+                if (impl->host_query_copies.size() + values.size() > 65536) {
+                    impl->host_query_copies.clear();
+                }
+                std::vector<VkBufferCopy> host_copies;
+                host_copies.reserve(values.size());
+                for (size_t i = 0; i < values.size(); ++i) {
+                    host_copies.push_back({values[i].offset, i * sizeof(u64), sizeof(u64)});
+                    impl->host_query_copies.insert_or_assign(values[i].address,
+                        QueryCacheRuntimeImpl::HostQueryCopy{slot, batch.generation, i * sizeof(u64)});
+                }
+                impl->scheduler.Record([src_buffer, dst = *batch.buffer,
+                                        copies = std::move(host_copies)](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.CopyBuffer(src_buffer, dst, copies);
+                    const VkMemoryBarrier host_barrier{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_PIPELINE_STAGE_HOST_BIT, 0, host_barrier);
+                });
+            }
+        }
+    }
     impl->scheduler.Record([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
         size_t size = dst_buffers.size();
         for (size_t i = 0; i < size; i++) {

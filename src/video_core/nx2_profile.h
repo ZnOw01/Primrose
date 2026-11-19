@@ -358,8 +358,12 @@ inline std::unordered_set<u64>& DmaReadPages() {
 
 inline void Add(Counter counter, u64 amount) {
     if (Enabled()) {
-        t_data.counters[static_cast<size_t>(counter)] += amount;
-        t_totals.counters[static_cast<size_t>(counter)] += amount;
+        const size_t index = static_cast<size_t>(counter);
+        t_data.counters[index] += amount;
+        // Totals keeps only the first counters (nx2_spikes): the others would write past it.
+        if (index < t_totals.counters.size()) {
+            t_totals.counters[index] += amount;
+        }
     }
 }
 

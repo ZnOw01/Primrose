@@ -191,8 +191,13 @@ private:
             Thunks& self = *static_cast<Thunks*>(state->user);
             const Word count = state->emit_count;
             state->emit_count = 0;
-            for (Word i = 0; i < count; ++i) {
-                self.emit(state->emit_buffer[i * 2], state->emit_buffer[i * 2 + 1]);
+            // An emitter with Batch takes the buffered (method, value) pairs at once, in order.
+            if constexpr (requires { self.emit.Batch(state->emit_buffer.data(), count); }) {
+                self.emit.Batch(state->emit_buffer.data(), count);
+            } else {
+                for (Word i = 0; i < count; ++i) {
+                    self.emit(state->emit_buffer[i * 2], state->emit_buffer[i * 2 + 1]);
+                }
             }
         }
         static bool CallEmit(State* state, Word method, Word value) {

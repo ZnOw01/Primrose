@@ -115,6 +115,10 @@ protected:
     /// @return True no success, false on error
     bool RefreshStages(std::array<u64, NUM_PROGRAMS>& unique_hashes);
 
+    u64 InvalidationSerial() const noexcept {
+        return invalidation_serial.load(std::memory_order_acquire);
+    }
+
     /// @brief Returns information about the current compute shader
     /// @return Pointer to a valid shader, nullptr on error
     const ShaderInfo* ComputeShader();

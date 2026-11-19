@@ -412,7 +412,7 @@ template <typename Traits>
 void DeviceMemoryManager<Traits>::InnerGatherDeviceAddresses(Common::ScratchBuffer<u32>& buffer,
                                                              PAddr address) {
     size_t phys_addr = address >> page_bits;
-    std::scoped_lock lk(mapping_guard);
+    std::shared_lock lk(mapping_guard);
     u32 backing = compressed_device_addr[phys_addr];
     if ((backing >> MULTI_FLAG_BITS) != 0) {
         impl->multi_dev_address.GatherValues(backing & MULTI_MASK, buffer);

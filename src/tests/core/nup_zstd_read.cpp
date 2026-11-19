@@ -140,7 +140,7 @@ FileSys::VirtualFile Backing(std::vector<u8> bytes) {
     return std::make_shared<FileSys::VectorVfsFile>(std::move(bytes));
 }
 
-bool ReadMatches(const FileSys::VirtualFile& file, const std::vector<u8>& content,
+[[maybe_unused]] bool ReadMatches(const FileSys::VirtualFile& file, const std::vector<u8>& content,
                  std::size_t offset, std::size_t length) {
     std::vector<u8> buffer(length);
     const std::size_t expected =
@@ -150,7 +150,7 @@ bool ReadMatches(const FileSys::VirtualFile& file, const std::vector<u8>& conten
                       content.begin() + static_cast<std::ptrdiff_t>(offset));
 }
 
-std::size_t DirectoryBytes(const fs::path& dir) {
+[[maybe_unused]] std::size_t DirectoryBytes(const fs::path& dir) {
     std::size_t total = 0;
     // Windows directory entries can report a stale size for a file that is still open.
     for (const auto& entry : fs::directory_iterator(dir)) {

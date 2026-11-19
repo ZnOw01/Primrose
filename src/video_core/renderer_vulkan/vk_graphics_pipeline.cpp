@@ -20,6 +20,9 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "common/cityhash.h"
+#include "common/logging.h"
+#include "video_core/memory_manager.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -314,6 +317,9 @@ GraphicsPipeline::GraphicsPipeline(
             continue;
         }
         stage_infos[stage] = *info;
+        if (VideoCommon::TextureHandleCache::Enabled()) {
+            handle_caches[stage].resize(info->handle_programs.size());
+        }
         enabled_uniform_buffer_masks[stage] = info->constant_buffer_mask;
         std::ranges::copy(info->constant_buffer_used_sizes, uniform_buffer_sizes[stage].begin());
         num_image_elements += Shader::NumDescriptors(info->texture_buffer_descriptors);
@@ -519,7 +525,61 @@ void GraphicsPipeline::RunBuild() {
     build_task = nullptr;
 }
 
+namespace {
+bool ReuseTransitionKeys() {
+    static constexpr bool enabled = true;
+    return enabled;
+}
+} // namespace
+
+GraphicsPipeline* GraphicsPipeline::Next(const GraphicsPipelineCacheKey& current_key) noexcept {
+    static constexpr bool hash_transitions = true;
+    if (hash_transitions && ReuseTransitionKeys()) {
+        const size_t hash = current_key.Hash();
+        if (transition_hash == hash && key == current_key) {
+            return this;
+        }
+        static constexpr bool packed_hashes = true;
+        if (packed_hashes) {
+            for (size_t i = 0; i < transitions.size(); ++i) {
+                if (transition_hashes[i] == hash && transitions[i]->Key() == current_key) {
+                    return transitions[i];
+                }
+            }
+        } else {
+            for (GraphicsPipeline* const candidate : transitions) {
+                if (candidate->transition_hash == hash && candidate->Key() == current_key) {
+                    return candidate;
+                }
+            }
+        }
+        return nullptr;
+    }
+    if (key == current_key) {
+        return this;
+    }
+    if (ReuseTransitionKeys()) {
+        for (GraphicsPipeline* const candidate : transitions) {
+            if (candidate->Key() == current_key) {
+                return candidate;
+            }
+        }
+        return nullptr;
+    }
+    const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
+    return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
+                                       : nullptr;
+}
+
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
+    if (ReuseTransitionKeys()) {
+        if (transitions.size() < 16 &&
+            std::find(transitions.begin(), transitions.end(), transition) == transitions.end()) {
+            transition_hashes[transitions.size()] = transition->transition_hash;
+            transitions.push_back(transition);
+        }
+        return;
+    }
     if (transition_keys.size() >= 16) {
         return;
     }
@@ -582,18 +642,21 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
-                return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                       info, desc.handle_program, *gpu_memory,
-                                       [&](u32 cbuf) -> GPUVAddr {
-                                           return cbuf < cbufs.size() && cbufs[cbuf].enabled
-                                                      ? cbufs[cbuf].address
-                                                      : GPUVAddr{};
-                                       },
-                                       device.GetStorageBufferAlignment()),
-                                   via_header_index);
+                const auto cbuf_address = [&](u32 cbuf) -> GPUVAddr {
+                    return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
+                                                                  : GPUVAddr{};
+                };
+                const u32 raw = VideoCommon::TextureHandleCache::Enabled()
+                                    ? handle_caches[stage][desc.handle_program].Evaluate(
+                                          info, desc.handle_program, *gpu_memory, cbuf_address,
+                                          device.GetStorageBufferAlignment())
+                                    : VideoCommon::EvaluateTextureHandle(
+                                          info, desc.handle_program, *gpu_memory, cbuf_address,
+                                          device.GetStorageBufferAlignment());
+                return TexturePair(raw, via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
-            const u32 index_offset{index << desc.size_shift};
+            const u32 index_offset{Shader::DescriptorElementOffset(desc, index)};
             const u32 offset{desc.cbuf_offset + index_offset};
             const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
             if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
@@ -808,8 +871,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if (!info.texture_descriptors.empty() || !info.image_descriptors.empty() ||
             !info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling,
-                                 samplers_it, views_it);
+            static constexpr bool specialize = true;
+            if (specialize) {
+                PushImageDescriptors<Spec::has_texture_buffers, Spec::has_image_buffers,
+                                     Spec::has_images>(texture_cache, guest_descriptor_queue, info,
+                                                       rescaling, samplers_it, views_it);
+            } else {
+                PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling,
+                                     samplers_it, views_it);
+            }
         }
     }};
     if constexpr (Spec::enabled_stages[0]) {
@@ -881,14 +951,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area,
                                      bool is_indexed) {
-    static const bool reuse_descriptors = [] {
-        const char* value = std::getenv("EDEN_NX2_DESCRIPTOR_REUSE");
-        const bool enabled = value == nullptr || value[0] != '0';
-        if (!enabled) {
-            LOG_INFO(Render_Vulkan, "Graphics descriptor payload reuse disabled for comparison");
-        }
-        return enabled;
-    }();
+    static constexpr bool reuse_descriptors = true;
+    static constexpr bool reuse_draw_state = true;
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
 
     VkDeviceSize descriptor_buffer_offset{};
@@ -940,6 +1004,24 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             scheduler.CanRecordBeforeRenderPass(texture_cache.GetFramebuffer()->Handle())};
         if (!before_pass) {
             scheduler.RequestOutsideRenderPassOperationContext();
+        }
+        if (!IsBuilt()) {
+            // The dispatches need the compute pipelines; the draw's own build wait comes after
+            // them (and after the whole pass's hoisted work).
+            const auto wait_built = [this](vk::CommandBuffer) {
+                RunBuild();
+                std::unique_lock lock{build_mutex};
+                build_condvar.wait(lock,
+                                   [this] { return is_built.load(std::memory_order::relaxed); });
+            };
+            if (before_pass) {
+                scheduler.RecordBeforeRenderPass(mesh_emulation->has_task
+                                                     ? Scheduler::PrePassStage::Task
+                                                     : Scheduler::PrePassStage::Mesh,
+                                                 wait_built);
+            } else {
+                scheduler.Record(wait_built);
+            }
         }
         if (before_pass) {
             // Before the pass: the same programs, one command per stage, without barriers of
@@ -1242,27 +1324,72 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         GPU::Logging::GPULogger::GetInstance().LogPipelineBind(false, pipeline_info);
     }
 
+    const u64 recording_epoch = scheduler.RecordingEpoch();
+    const bool same_draw_state = reuse_draw_state && !mesh_emulation && !bind_pipeline &&
+                                 last_configure_recording_epoch == recording_epoch;
     bool update_descriptors = true;
-    if (descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) {
+    if (descriptor_set_layout && !uses_descriptor_buffer &&
+        (!uses_push_descriptor || (reuse_draw_state && !mesh_emulation))) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         update_descriptors =
             !reuse_descriptors || bind_pipeline ||
+            (reuse_draw_state && !same_draw_state) ||
             last_descriptor_payload.size() != num_descriptor_entries ||
             std::memcmp(last_descriptor_payload.data(), entries,
                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) != 0;
         if (update_descriptors) {
-            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+            static constexpr bool copy_payload = true;
+            if (copy_payload) {
+                static_assert(std::is_trivially_copyable_v<DescriptorUpdateEntry>);
+                if (last_descriptor_payload.size() != num_descriptor_entries) {
+                    last_descriptor_payload.resize(num_descriptor_entries);
+                }
+                if (num_descriptor_entries != 0) {
+                    std::memcpy(last_descriptor_payload.data(), entries,
+                                num_descriptor_entries * sizeof(DescriptorUpdateEntry));
+                }
+            } else {
+                last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+            }
         }
     }
     // The mesh emulation binds its descriptor sets on every draw (dispatch and draw).
     if (descriptor_set_layout && !uses_descriptor_buffer &&
-        (uses_push_descriptor || update_descriptors || mesh_emulation)) {
+        (update_descriptors || mesh_emulation)) {
         scheduler.InvalidateDescriptorBuffer();
     }
     const auto rescaling_data = rescaling.Data();
+    const bool push_rescaling = !same_draw_state || !has_pushed_rescaling ||
+                                last_rescaling_words != rescaling_data;
+    const bool push_render_area = render_area.uses_render_area &&
+                                  (!same_draw_state || !last_uses_render_area ||
+                                   last_render_area_words != render_area.words);
+    if (reuse_draw_state) {
+        last_configure_recording_epoch = recording_epoch;
+        last_rescaling_words = rescaling_data;
+        has_pushed_rescaling = true;
+        last_render_area_words = render_area.words;
+        last_uses_render_area = render_area.uses_render_area;
+    }
+    const bool set_descriptor_offset =
+        !VideoCommon::Nx2GpuSide::On(VideoCommon::Nx2GpuSide::Opt::DrawState) ||
+        !same_draw_state || bind_descriptor_buffer ||
+        last_bound_descriptor_offset != descriptor_buffer_offset ||
+        last_bound_descriptor_chunk != descriptor_buffer_chunk;
+    last_bound_descriptor_offset = descriptor_buffer_offset;
+    last_bound_descriptor_chunk = descriptor_buffer_chunk;
+    if (VideoCommon::Nx2GpuSide::On(VideoCommon::Nx2GpuSide::Opt::DrawState) &&
+        !mesh_emulation && !bind_pipeline && !bind_descriptor_buffer && !push_rescaling &&
+        !update_rescaling && !push_render_area &&
+        (!descriptor_set_layout ||
+         (uses_descriptor_buffer ? !set_descriptor_offset : !update_descriptors))) {
+        return true;
+    }
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
+                      set_descriptor_offset,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       mesh_set_slot, rescaling_data, is_rescaling, update_rescaling,
+                      push_rescaling, push_render_area,
                       uses_render_area = render_area.uses_render_area,
                       render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
@@ -1283,16 +1410,33 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
                       VK_SHADER_STAGE_MESH_BIT_EXT
                 : VK_SHADER_STAGE_ALL_GRAPHICS;
-        cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
-                             sizeof(rescaling_data), rescaling_data.data());
-        if (update_rescaling || mesh_emulation) {
+        const bool combined_rescaling =
+            VideoCommon::Nx2GpuSide::On(VideoCommon::Nx2GpuSide::Opt::DrawState) &&
+            push_rescaling && update_rescaling && push_stages == VK_SHADER_STAGE_ALL_GRAPHICS &&
+            !mesh_emulation;
+        if (combined_rescaling) {
+            struct ScalingConstants {
+                std::array<u32, 6> words;
+                f32 down_factor;
+            };
+            static_assert(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET ==
+                          RESCALING_LAYOUT_WORDS_OFFSET + offsetof(ScalingConstants, down_factor));
+            const ScalingConstants constants{
+                rescaling_data, is_rescaling ? Settings::values.resolution_info.down_factor : 1.0f};
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                                 sizeof(constants), &constants);
+        } else if (push_rescaling) {
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                                 sizeof(rescaling_data), rescaling_data.data());
+        }
+        if (!combined_rescaling && (update_rescaling || mesh_emulation)) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
             cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
                                  &scale_down_factor);
         }
-        if (uses_render_area) {
+        if (uses_render_area && push_render_area) {
             cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                                  RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
                                  &render_area_data);
@@ -1309,12 +1453,17 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             return;
         }
         if (uses_descriptor_buffer) {
+            if (!set_descriptor_offset) {
+                return;
+            }
             const u32 buffer_index{};
             cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
                                                  0, buffer_index, descriptor_buffer_offset);
         } else if (uses_push_descriptor) {
-            cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
-                                                    0, descriptor_data);
+            if (update_descriptors) {
+                cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
+                                                         0, descriptor_data);
+            }
         } else if (update_descriptors) {
             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
             const vk::Device& dev{device.GetLogical()};

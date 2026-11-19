@@ -84,6 +84,7 @@ public:
             native_compute_uploaded = false;
         native_context = context;
         native_mode = shared_macro != nullptr;
+        native_compute = native_mode;
         upload_state.SetNativePartialTransfers(native_mode);
         native_macro = shared_macro;
         native_macro_positions = positions;
@@ -268,6 +269,9 @@ public:
 
     bool IsNativeMode() const {
         return native_mode;
+    }
+    bool CanBatchInlineData(size_t words) const {
+        return upload_state.CanBatchLinearData(words);
     }
     /// NVIDIA DLSS (DLAA and Super Resolution) in place of Ocarina of Time's post-tonemap
     /// anti-aliasing / upscaling (ocarina_upscale.h), when the setting is on: true when it

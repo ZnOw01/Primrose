@@ -468,15 +468,19 @@ Id DescType(EmitContext& ctx, Id sampled_type, Id pointer_type, u32 count) {
         return pointer_type;
     }
 }
-// EDEN_NX2_LEAN_SSBO=0 turns it off: the global memory helpers are kept as calls and route
-// with one switch. Inlined at each of their calls, a program with ~30 candidate buffers took
-// NVIDIA's compiler 2.4 s (Ocarina's foliage compute programs; 0.6 s this way, same accesses).
-bool LeanGlobalMemory() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_LEAN_SSBO");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
+// The global memory helpers are kept as calls (DontInline) and route with one switch. Inlined at
+// each of their calls, a program with ~30 candidate buffers took NVIDIA's compiler 2.4 s
+// (Ocarina's foliage compute programs; 0.6 s as calls), and Ocarina's market ran at ~45 instead
+// of ~58 FPS on an RTX 4070 SUPER. Task and mesh programs keep them inlined: as calls, the first
+// of two consecutive loads in Ocarina's tree task program returned 0 on NVIDIA, so every tree
+// cell drew its 256-record cap (a wall of trees in Hyrule Field). EDEN_NX2_LEAN_SSBO=0/1 forces
+// inlined/calls for every stage.
+bool LeanGlobalMemory(Stage stage) {
+    static const char* const forced = std::getenv("EDEN_NX2_LEAN_SSBO");
+    if (forced != nullptr) {
+        return forced[0] != '0';
+    }
+    return stage != Stage::Task && stage != Stage::Mesh;
 }
 } // Anonymous namespace
 
@@ -996,7 +1000,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                                  runtime_info.mesh_as_compute &&
                                  (stage == Stage::Task || stage == Stage::Mesh)};
     const spv::FunctionControlMask helper_control{
-        LeanGlobalMemory() ? spv::FunctionControlMask::DontInline
+        LeanGlobalMemory(stage) ? spv::FunctionControlMask::DontInline
                            : spv::FunctionControlMask::MaskNone};
     const spv::FunctionControlMask load_control{
         inline_mesh_loads ? spv::FunctionControlMask::Inline : helper_control};
@@ -1064,7 +1068,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 best_distance = OpSelect(U64, better, distance, best_distance);
                 best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
             }
-            if (LeanGlobalMemory()) {
+            if (LeanGlobalMemory(stage)) {
                 std::vector<Sirit::Literal> literals;
                 std::vector<Id> labels;
                 for (size_t index = 0; index < num_buffers; ++index) {

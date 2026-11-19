@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <iterator>
 #include <map>
 #include <span>
@@ -18,6 +19,22 @@ namespace Vulkan {
 // A query batch may write the same guest address repeatedly. vkCmdCopyBuffer forbids
 // overlapping destinations in one command; retain the bytes from the last query write.
 inline std::vector<VkBufferCopy> NonOverlappingQueryCopies(std::span<const VkBufferCopy> copies) {
+    static constexpr bool ordered_fast_path = true;
+    if (ordered_fast_path) {
+        VkDeviceSize end{};
+        bool ordered = true;
+        for (const auto& copy : copies) {
+            if (copy.size == 0 || copy.dstOffset < end ||
+                copy.size > ~VkDeviceSize{0} - copy.dstOffset) {
+                ordered = false;
+                break;
+            }
+            end = copy.dstOffset + copy.size;
+        }
+        if (ordered) {
+            return {copies.begin(), copies.end()};
+        }
+    }
     std::map<VkDeviceSize, VkBufferCopy> writes;
     for (const auto& copy : copies) {
         if (copy.size == 0) {

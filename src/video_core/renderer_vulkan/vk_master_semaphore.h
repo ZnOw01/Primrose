@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "video_core/renderer_vulkan/vk_nx2_sync.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -54,6 +55,10 @@ public:
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
+    Nx2Sync::ImportWarmup& HostImportWarmup() {
+        return import_warmup;
+    }
+
     /// Submits the device graphics queue, updating the tick as necessary
     VkResult SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                          VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);
@@ -71,6 +76,8 @@ private:
     vk::Fence GetFreeFence();
 
 private:
+    Nx2Sync::ImportWarmup import_warmup;
+    Nx2Sync::TimelineWaits timeline_waits;
     const Device& device;             ///< Device.
     vk::Semaphore semaphore;          ///< Timeline semaphore.
     std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.

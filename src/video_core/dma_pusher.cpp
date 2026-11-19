@@ -33,7 +33,6 @@
 
 namespace Tegra {
 
-
 constexpr u32 MacroRegistersStart = 0xE00;
 
 // Compute dispatches, uploads and reports and DMA copies write the command lists
@@ -65,6 +64,10 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
 DmaPusher::~DmaPusher() = default;
 
 void DmaPusher::DispatchCalls() {
+    front_lean = VideoCommon::FrontLeanEnabled();
+    if (front_lean) {
+        dispatch_program_id = system.GetApplicationProcessProgramID();
+    }
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
     dma_state.is_last_call = true;
     while (system.IsPoweredOn()) {
@@ -125,7 +128,7 @@ bool DmaPusher::Step() {
     if (prefetch_size > 0) {
         const std::span<const CommandHeader> commands{command_list.prefetch_command_list};
         command_resume_offset +=
-            ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset, true);
         if (puller.HasPendingAcquire()) {
             return false;
         }
@@ -232,43 +235,40 @@ bool DmaPusher::Step() {
         // stale (Fast Fusion's culling fills in instanced draws' arguments; stale ones asked for
         // billions of instances and lost the device loading a race).
         bool gpu_written = !skip_record_read &&
-            IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-        // EDEN_NX2_ENTRY_WRITER_STATS=1 counts these waits and how many found newly GPU-written
-        // words; =2 also skips the wait (unsafe, measurement only).
-        static const int entry_writer_stats = [] {
-            const char* text = std::getenv("EDEN_NX2_ENTRY_WRITER_STATS");
-            return text != nullptr ? std::atoi(text) : 0;
-        }();
+            (front_lean
+                 ? IsGpuWrittenCommandsFront(dma_state.dma_get, size_t{header.size} * sizeof(u32))
+                 : IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32)));
+        // Waiting for every earlier writer before each entry stalled the front on nearly every
+        // entry: OoT's market waited ~7,400 times a frame and never found newly GPU-written
+        // words, 49 -> 59 FPS without the waits. Only title 040041E0212AE000 keeps them (it
+        // read stale culling arguments without).
+        constexpr u64 EntryWriterWaitProgramId = 0x040041E0212AE000ULL;
+        const bool wait_entry_writers =
+            (front_lean ? dispatch_program_id : system.GetApplicationProcessProgramID()) ==
+            EntryWriterWaitProgramId;
         if (!skip_record_read && !gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            entry_writer_stats != 2 &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
-            gpu_written =
-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-            if (entry_writer_stats != 0) {
-                static u64 waits{}, found{};
-                ++waits;
-                found += gpu_written ? 1 : 0;
-                if (waits % 20000 == 0) {
-                    LOG_INFO(HW_GPU, "nx2 entry writer waits: {} ({} found GPU-written words)",
-                             waits, found);
-                }
-            }
+            wait_entry_writers && VideoCommon::GpuSplit::Get().WaitForWriters()) {
+            gpu_written = (front_lean ? IsGpuWrittenCommandsFront(dma_state.dma_get,
+                                                                  size_t{header.size} * sizeof(u32))
+                                      : IsGpuWrittenCommands(dma_state.dma_get,
+                                                             size_t{header.size} * sizeof(u32)));
         }
         // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
         // safe read below would flush (with the split, the front can't tell: it reads memory
         // unflushed anyway). Entries on pages the GPU writes (culling) always take the flushing
         // read: their words at submit time are an older frame's.
-        const bool submitted = command_resume_offset < header.size &&
-                               dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
-                               (command_list.snapshot_suspensions & 1) == 0 &&
-                               command_list.snapshot_suspensions ==
-                                   suspensions.load(std::memory_order_acquire) &&
-                               !std::ranges::binary_search(
-                                   command_list.deferred_entries,
-                                   static_cast<u32>(dma_pushbuffer_subindex)) &&
-                               !gpu_written &&
-                               !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
-                                                                          header.size * sizeof(u32)));
+        const bool submitted =
+            command_resume_offset < header.size &&
+            dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+            (command_list.snapshot_suspensions & 1) == 0 &&
+            command_list.snapshot_suspensions == suspensions.load(std::memory_order_acquire) &&
+            !(front_lean
+                  ? command_list.FrontDeferredEntry(static_cast<u32>(dma_pushbuffer_subindex))
+                  : std::ranges::binary_search(command_list.deferred_entries,
+                                               static_cast<u32>(dma_pushbuffer_subindex))) &&
+            !gpu_written &&
+            !(use_safe &&
+              memory_manager.IsMemoryDirty(dma_state.dma_get, header.size * sizeof(u32)));
         // Off by default: the check below reads memory and allocates for each entry it checks.
         // EDEN_NX2_PERF_VERIFY=1 turns it on.
         static const bool check_parsed_entries = VideoCommon::Nx2Perf::Verify();
@@ -333,7 +333,7 @@ bool DmaPusher::Step() {
                 RecordParsedEntry(header, commands);
             }
             command_resume_offset +=
-                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset, true);
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
@@ -413,7 +413,163 @@ static const u32 g_semaphore_watch = [] {
 // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
 static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
 
-size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+// Opt-in: retain the original parser for ablation and its existing verifier.
+size_t DmaPusher::ProcessCommandsFront(std::span<const CommandHeader> commands,
+                                      size_t word_offset, bool owned_words) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    u32 cached_subchannel = max_subchannels;
+    Engines::Maxwell3D* cached_3d = nullptr;
+    const auto front_3d = [&]() -> Engines::Maxwell3D* {
+        if (dma_state.method < non_puller_methods) {
+            return nullptr;
+        }
+        if (cached_subchannel != dma_state.subchannel) {
+            cached_subchannel = dma_state.subchannel;
+            cached_3d = nullptr;
+            auto* const engine = subchannels[cached_subchannel];
+            if (engine != nullptr &&
+                subchannel_type[cached_subchannel] == Engines::EngineTypes::Maxwell3D) {
+                auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(engine);
+                if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                    cached_3d = maxwell3d;
+                }
+            }
+        }
+        return cached_3d;
+    };
+
+    size_t index = 0;
+    while (index < commands.size()) {
+        if (dma_state.method_count == 0) {
+            const u32 header = commands[index++].argument;
+            const auto mode = static_cast<SubmissionMode>(header >> 29);
+            switch (mode) {
+            case SubmissionMode::Increasing:
+            case SubmissionMode::NonIncreasing:
+            case SubmissionMode::IncreaseOnce:
+                dma_state.method = header & 0x1fff;
+                dma_state.subchannel = (header >> 13) & 7;
+                dma_state.method_count = (header >> 16) & 0x1fff;
+                dma_state.non_incrementing = mode == SubmissionMode::NonIncreasing;
+                dma_increment_once = mode == SubmissionMode::IncreaseOnce;
+                break;
+            case SubmissionMode::Inline:
+                dma_state.method = header & 0x1fff;
+                dma_state.subchannel = (header >> 13) & 7;
+                dma_state.dma_word_offset = u64(-s64(dma_state.dma_get));
+                // Inline inherits is_last_call, exactly as the original parser does.
+                if (auto* const maxwell3d = front_3d()) {
+                    maxwell3d->FrontCallMethod(system, split, dma_state.method,
+                                              (header >> 16) & 0x1fff,
+                                              dma_state.is_last_call);
+                } else {
+                    CallMethod((header >> 16) & 0x1fff);
+                    cached_subchannel = max_subchannels;
+                }
+                dma_state.non_incrementing = true;
+                dma_increment_once = false;
+                if (puller.HasPendingAcquire()) {
+                    return index;
+                }
+                continue;
+            default:
+                // Modes 0 and 2 are not aliases in the current implementation.
+                continue;
+            }
+            if (dma_state.method_count == 0 || index == commands.size()) {
+                continue;
+            }
+        }
+
+        const u32 pending = dma_state.method_count;
+        u32 count = static_cast<u32>(std::min<size_t>(pending, commands.size() - index));
+        const u32 method = dma_state.method;
+        const u32* const words = &commands[index].argument;
+        dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
+        auto* const maxwell3d = front_3d();
+
+        if (dma_state.non_incrementing) {
+            if (maxwell3d != nullptr) {
+                // Keep MultiMethod's special upload, shadow and ring-entry semantics.
+                maxwell3d->FrontCallMultiMethod(system, split, method, words, count, pending);
+            } else {
+                if (method < non_puller_methods) {
+                    count = 1; // an NX2 puller word can suspend the channel
+                }
+                CallMultiMethod(words, count);
+                cached_subchannel = max_subchannels;
+            }
+            dma_state.method_count -= count;
+            dma_state.is_last_call = true;
+        } else if (maxwell3d != nullptr && method >= MacroRegistersStart) {
+            // Macro methods only accumulate parameters; the first method selects the macro.
+            if (dma_increment_once && count > 1) {
+                // Match the state at the original NI tail's engine call.
+                ++dma_state.method;
+                dma_state.non_incrementing = true;
+                dma_state.method_count = pending - 1;
+                dma_state.is_last_call = false;
+                dma_state.dma_word_offset += sizeof(u32);
+                maxwell3d->FrontCallMultiMethod(system, split, method, words, count, pending,
+                                               owned_words);
+                dma_state.method_count = pending - count;
+                dma_state.is_last_call = true;
+            } else if (dma_increment_once) {
+                dma_state.is_last_call = pending <= 1;
+                maxwell3d->FrontCallMethod(system, split, method, words[0],
+                                          dma_state.is_last_call);
+                ++dma_state.method;
+                dma_state.non_incrementing = true;
+                --dma_state.method_count;
+            } else {
+                // In increasing mode every parameter follows the same front macro path.
+                dma_state.is_last_call = count == pending;
+                dma_state.dma_word_offset += u64{count - 1} * sizeof(u32);
+                dma_state.method = method + count - 1;
+                dma_state.method_count = pending - count + 1;
+                maxwell3d->FrontCallMultiMethod(system, split, method, words, count, pending,
+                                               owned_words);
+                dma_state.method = method + count;
+                dma_state.method_count = pending - count;
+            }
+        } else if (maxwell3d != nullptr && !dma_increment_once) {
+            count = std::min(count, MacroRegistersStart - method);
+            maxwell3d->FrontCallMethodRun(system, split, method, words, count, true, pending);
+            dma_state.dma_word_offset += u64{count - 1} * sizeof(u32);
+            dma_state.is_last_call = count == pending;
+            dma_state.method += count;
+            dma_state.method_count -= count;
+        } else {
+            count = 1;
+            dma_state.is_last_call = pending <= 1;
+            if (maxwell3d != nullptr) {
+                maxwell3d->FrontCallMethod(system, split, method, words[0],
+                                          dma_state.is_last_call);
+            } else {
+                CallMethod(words[0]);
+                cached_subchannel = max_subchannels;
+            }
+            ++dma_state.method;
+            dma_state.non_incrementing |= dma_increment_once;
+            --dma_state.method_count;
+        }
+        index += count;
+        if (maxwell3d == nullptr && puller.HasPendingAcquire()) {
+            return index;
+        }
+    }
+    return index;
+}
+
+size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset,
+                                  bool owned_words) {
+    if (g_semaphore_watch == 0 &&
+        g_nx2_ampere.load(std::memory_order_relaxed) &&
+        VideoCommon::GpuSplit::Get().Active() && VideoCommon::GpuSplit::Get().FrontMacros() &&
+        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FrontRun) &&
+        !VideoCommon::Nx2Perf::Verify() && !puller.HasPendingAcquire()) {
+        return ProcessCommandsFront(commands, word_offset, owned_words);
+    }
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
@@ -652,7 +808,6 @@ void DmaPusher::SetState(const CommandHeader& command_header) {
     dma_state.method_count = command_header.method_count;
 }
 
-
 void DmaPusher::WatchArgument(u32 method, u32 argument) const {
     const u32 watch = g_semaphore_watch;
     if ((argument & ~0xfU) == watch) {
@@ -808,6 +963,8 @@ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
                                        entry.size * sizeof(u32));
     }
     list.deferred_entries.clear();
+    list.front_deferred_cursor = 0;
+    list.front_deferred_index = 0;
 }
 
 void DmaPusher::RefreshDeferredEntries(CommandList& list) {
@@ -824,6 +981,27 @@ void DmaPusher::RefreshDeferredEntries(CommandList& list) {
                                        entry.size * sizeof(u32));
     }
     list.deferred_entries.clear();
+    list.front_deferred_cursor = 0;
+    list.front_deferred_index = 0;
+}
+
+bool DmaPusher::IsGpuWrittenCommandsFront(GPUVAddr address, size_t size) {
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
+        return false;
+    }
+    const u64 serial = memory_manager.GetMapSerial();
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (page != written_gpu_page || serial != written_map_serial) {
+            written_device_page = memory_manager.GpuToCpuAddress(page);
+            written_gpu_page = page;
+            written_map_serial = serial;
+        }
+        // The back can mark a previously clean page between any two entries.
+        if (written_device_page && Tegra::Nx2IsGpuWritten(*written_device_page)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
