@@ -34,6 +34,10 @@ on:
         description: Force-save the compiler and CPM caches at the end of the job
         type: boolean
         default: false
+      werror:
+        description: Treat the project's warnings as errors
+        type: boolean
+        default: true
       runner:
         type: string
         default: macos-26
@@ -117,7 +121,8 @@ jobs:
             -DEGLANTINE_RELEASE_PLATFORM=${{ env.PLATFORM }} \
             -DUSE_DISCORD_PRESENCE=ON \
             -DUSE_CCACHE=ON \
-            -DNIGHTLY_BUILD=${{ inputs.nightly && 'ON' || 'OFF' }}
+            -DNIGHTLY_BUILD=${{ inputs.nightly && 'ON' || 'OFF' }} \
+            -DENABLE_WERROR=${{ inputs.werror && 'ON' || 'OFF' }}
 
       - name: ccache settings
         shell: bash

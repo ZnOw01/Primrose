@@ -42,6 +42,8 @@ jobs:
       release: false
       nightly: true
       pgo: none
+      # The parent's ci keeps warnings fatal. A release of its code must not stop on one.
+      werror: false
 
   windows:
     needs: prepare
@@ -66,6 +68,7 @@ jobs:
       release: false
       nightly: true
       runner: ${{ vars.MACOS_RUNNER || 'macos-26' }}
+      werror: false
 
   publish:
     needs: [prepare, linux, windows, macos]
@@ -145,6 +148,11 @@ jobs:
           fi
           printf 'Own-fixes build of `%s` at `%s`.\n\nBuilt automatically from a push to the personal experimental branch. Not an upstream stable release.\n' \
             "$GITHUB_REF_NAME" "$GITHUB_SHA" > notes.md
+          {
+            printf '\n## SHA-256\n\n```\n'
+            (cd release-assets && sha256sum -- *)
+            printf '```\n'
+          } >> notes.md
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$error_file"; then
             :
           elif grep -Fxq 'release not found' "$error_file"; then
@@ -211,3 +219,7 @@ jobs:
               raise SystemExit(f'Release assets differ after publishing: missing {missing}, extra {extra}')
           PY
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')" = "$GITHUB_SHA"
+          {
+            echo "Published [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG) from \`$GITHUB_SHA\`."
+            cat notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
