@@ -1814,6 +1814,11 @@ u64 Device::GetDeviceMemoryUsage() const {
     return result;
 }
 
+u64 Device::GetMainHeapSize() const {
+    const u64 size = physical.GetMemoryProperties().memoryProperties.memoryHeaps[main_heap].size;
+    return heap_size_limit != 0 ? (std::min)(size, heap_size_limit) : size;
+}
+
 u64 Device::GetDeviceMemorySlack() const {
     if (allocator == nullptr) {
         return 0;

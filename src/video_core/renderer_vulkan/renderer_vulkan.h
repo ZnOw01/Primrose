@@ -62,6 +62,13 @@ public:
         return device.GetDriverName();
     }
 
+    [[nodiscard]] std::optional<DeviceMemory> GetDeviceMemory() const override {
+        if (!device.CanReportMemoryUsage()) {
+            return std::nullopt;
+        }
+        return DeviceMemory{device.GetDeviceMemoryUsage(), device.GetMainHeapSize()};
+    }
+
     // Enhanced platform-specific initialization
     void InitializePlatformSpecific();
 

@@ -7,43 +7,260 @@
 // SPDX-FileCopyrightText: 2015 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <filesystem>
+
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QList>
 #include <QListView>
+#include <QHBoxLayout>
 #include <QMenu>
+#include <QMessageBox>
+#include <QPainter>
+#include <QPointer>
+#include <QPropertyAnimation>
+#include <QResizeEvent>
 #include <QScrollBar>
 #include <QScroller>
 #include <QScrollerProperties>
+#include <QThreadPool>
+#include <QTimer>
 #include <QToolButton>
 #include <QVariantAnimation>
 #include <qlayoutitem.h>
 
 #include "common/common_types.h"
+#include "common/fs/fs.h"
+#include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "core/core.h"
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/loader/loader.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/game_list_p.h"
 #include "qt_common/game_list/model.h"
 #include "qt_common/qt_common.h"
 #include "qt_common/util/game.h"
+#include "qt_common/util/game_art.h"
 #include "yuzu/game/carousel.h"
+#include "yuzu/game/game_details_panel.h"
 #include "yuzu/game/game_grid.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/game/game_tree.h"
+#include "yuzu/game/home_background.h"
+#include "yuzu/game/home_customize_panel.h"
+#include "yuzu/game/home_side_panel.h"
 #include "yuzu/game/search_field.h"
 #include "yuzu/main_window.h"
 #include "yuzu/shader_warm_dialog.h"
 #include "yuzu/util/controller_navigation.h"
+
+/// The banner backdrop crossfades just behind the slide, so the change reads as one motion.
+constexpr int BannerFadeMs = 260;
+/// How far up from the bottom the filter bar's fade into the panel surface reaches.
+constexpr int BarFadeHeight = 80;
+
+/// Holds the game views and paints the home screen background behind them.
+class HomeSurface : public QWidget {
+public:
+    HomeSurface(HomeBackground* background_, QWidget* parent)
+        : QWidget{parent}, background{background_} {
+        connect(background, &HomeBackground::FrameChanged, this, [this] {
+            cached = {};
+            update();
+        });
+
+        m_banner_anim = new QVariantAnimation(this);
+        m_banner_anim->setDuration(BannerFadeMs);
+        m_banner_anim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_banner_anim, &QVariantAnimation::valueChanged, this,
+                [this](const QVariant& value) {
+                    m_banner_alpha = value.toReal();
+                    if (m_banner_alpha >= 1.0) {
+                        m_banner_from = {};
+                    }
+                    update();
+                });
+
+    }
+
+    /// Whether the filter bar sits at the bottom and blends into the backdrop.
+    void SetFilterZoneVisible(bool visible) {
+        if (m_filter_zone_visible == visible) {
+            return;
+        }
+        m_filter_zone_visible = visible;
+        update();
+    }
+
+    /// The game whose banner backs the home screen while the carousel is showing. A game
+    /// without one, or an empty id, falls back to the normal background.
+    void SetBannerGame(u64 program_id) {
+        if (m_banner_id == program_id) {
+            return;
+        }
+        m_banner_id = program_id;
+        // Load on the next loop turn, so a slide's first frames are not blocked by the decode.
+        if (m_banner_load_queued) {
+            return;
+        }
+        m_banner_load_queued = true;
+        QMetaObject::invokeMethod(
+            this,
+            [this] {
+                m_banner_load_queued = false;
+                m_banner_from = m_banner_to;
+                m_banner_to =
+                    HomeBackground::ScaledHero(m_banner_id, size(), devicePixelRatioF());
+                m_banner_alpha = m_banner_from.isNull() && m_banner_to.isNull() ? 1.0 : 0.0;
+                if (m_banner_alpha < 1.0) {
+                    m_banner_anim->stop();
+                    m_banner_anim->setStartValue(0.0);
+                    m_banner_anim->setEndValue(1.0);
+                    m_banner_anim->start();
+                }
+                update();
+            },
+            Qt::QueuedConnection);
+    }
+
+    /// Re-reads the current game's banner after its artwork file was changed or removed.
+    /// SetBannerGame normally ignores a repeat id, so reset it to force a fresh decode.
+    void RefreshBanner() {
+        const u64 id = m_banner_id;
+        m_banner_id = 0;
+        SetBannerGame(id);
+    }
+
+protected:
+    void resizeEvent(QResizeEvent* event) override {
+        QWidget::resizeEvent(event);
+        // The banner decodes at a given size, so re-read it at the new one; queued like a
+        // slide loads its banner, so the first paint at the new size stretches the old
+        // pixmap over the gap instead of blocking on the decode.
+        if (m_banner_id != 0 && !size().isEmpty()) {
+            RefreshBanner();
+        }
+    }
+
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        PaintBackdrop(p);
+        // A short fade into the panel surface so the filter bar blends into whatever backs it,
+        // the same wash the loading screen fades its artwork into.
+        if (m_filter_zone_visible) {
+            const QColor window = palette().color(QPalette::Window);
+            QColor clear = window;
+            clear.setAlpha(0);
+            QLinearGradient fade(0, height() - BarFadeHeight, 0, height());
+            fade.setColorAt(0.0, clear);
+            fade.setColorAt(1.0, window);
+            p.fillRect(QRect(0, height() - BarFadeHeight, width(), BarFadeHeight), fade);
+        }
+    }
+
+private:
+    /// The backdrop behind everything: the carousel's banner, or the normal background.
+    void PaintBackdrop(QPainter& p) {
+        // The banner backdrop, when one is set for the centered game: the whole surface, filter
+        // bar included, so the backdrop reads as one continuous thing.
+        if (UISettings::values.carousel_banner_background.GetValue() &&
+            UISettings::values.game_list_mode.GetValue() ==
+                Settings::GameListMode::CarouselView) {
+            const bool has_from = !m_banner_from.isNull() && m_banner_alpha < 1.0;
+            const bool has_to = !m_banner_to.isNull();
+            if (has_from || has_to) {
+                if (has_from) {
+                    if (!has_to) {
+                        // The last banner ebbs away over the normal background.
+                        p.setOpacity(1.0 - m_banner_alpha);
+                    }
+                    // A banner decoded at an older, smaller size must still cover the whole surface,
+                    // or the uncovered strip reads as a grey panel.
+                    p.drawPixmap(rect(), m_banner_from);
+                    p.setOpacity(1.0);
+                }
+                if (has_to && m_banner_alpha > 0.0) {
+                    p.setOpacity(m_banner_alpha);
+                    p.drawPixmap(rect(), m_banner_to);
+                    p.setOpacity(1.0);
+                }
+                // The same readability scrim the picture path applies.
+                QColor scrim = palette().color(QPalette::Window);
+                scrim.setAlpha(90);
+                p.fillRect(rect(), scrim);
+                return;
+            }
+        }
+
+        // A solid or gradient fill paints directly; only a picture needs the scaled cover.
+        const auto kind = background->GetKind();
+        if (kind != HomeBackground::Kind::Picture) {
+            if (kind == HomeBackground::Kind::Gradient) {
+                QLinearGradient gradient(rect().topLeft(), rect().bottomRight());
+                gradient.setColorAt(0.0, background->Color());
+                gradient.setColorAt(1.0, background->Color2());
+                p.fillRect(rect(), gradient);
+            } else {
+                p.fillRect(rect(), background->Color());
+            }
+            return;
+        }
+        if (background->IsEmpty()) {
+            return;
+        }
+        const QImage& frame = background->Frame();
+        const qreal dpr = devicePixelRatioF();
+        if (cached.isNull() || cached_key != frame.cacheKey() || cached_size != size() ||
+            cached.devicePixelRatio() != dpr) {
+            cached = QPixmap(size() * dpr);
+            cached.setDevicePixelRatio(dpr);
+            QPainter cp(&cached);
+            cp.setRenderHint(QPainter::SmoothPixmapTransform);
+            HomeBackground::PaintCover(cp, rect(), frame);
+            // Keep game names and the tree's columns readable on bright or busy backgrounds.
+            QColor scrim = palette().color(QPalette::Window);
+            scrim.setAlpha(90);
+            cp.fillRect(rect(), scrim);
+            cached_key = frame.cacheKey();
+            cached_size = size();
+        }
+        p.drawPixmap(0, 0, cached);
+    }
+
+    void showEvent(QShowEvent* event) override {
+        background->SetActive(true);
+        QWidget::showEvent(event);
+    }
+
+    void hideEvent(QHideEvent* event) override {
+        background->SetActive(false);
+        QWidget::hideEvent(event);
+    }
+
+private:
+    HomeBackground* background;
+    QPixmap cached;
+    qint64 cached_key = 0;
+    QSize cached_size;
+    /// The banner backdrop crossfade, and how far it has run.
+    QVariantAnimation* m_banner_anim = nullptr;
+    QPixmap m_banner_from;
+    QPixmap m_banner_to;
+    qreal m_banner_alpha = 1.0;
+    u64 m_banner_id = 0;
+    bool m_banner_load_queued = false;
+    bool m_filter_zone_visible = true;
+};
 
 GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvider* provider_,
                    PlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
@@ -52,10 +269,19 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
       play_time_manager{play_time_manager_}, system{system_} {
 
     this->main_window = parent;
-    layout = new QVBoxLayout;
+
+
+    outer_layout = new QHBoxLayout(this);
+    outer_layout->setContentsMargins(0, 0, 0, 0);
+    outer_layout->setSpacing(0);
+
+    background = new HomeBackground(this);
+    surface = new HomeSurface(background, this);
+    outer_layout->addWidget(surface, 1);
+
+    layout = new QVBoxLayout(surface);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
-    setLayout(layout);
 
     item_model = new GameListModel(vfs, provider, play_time_manager, system, this);
 
@@ -67,15 +293,26 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     controller_navigation = new ControllerNavigation(system.HIDCore(), this);
 
     SetupScrollAnimation();
+    SetupCustomization();
+    SetupGameDetails();
 
-    connect(tree_view, &QTreeView::activated, this, &GameList::ValidateEntry);
-    connect(tree_view, &QTreeView::customContextMenuRequested, this, &GameList::PopupContextMenu);
-
-    connect(grid_view, &QListView::activated, this, &GameList::ValidateEntry);
-    connect(grid_view, &QListView::customContextMenuRequested, this, &GameList::PopupContextMenu);
-
-    connect(carousel_view, &QListView::activated, this, &GameList::ValidateEntry);
-    connect(carousel_view, &QListView::customContextMenuRequested, this, &GameList::PopupContextMenu);
+    // A click opens the details sidebar; double-click, Enter and controller A start the game.
+    // Enter is handled in eventFilter, since `activated` also fires on a single click on
+    // platforms that activate items that way.
+    for (QAbstractItemView* view :
+         {static_cast<QAbstractItemView*>(tree_view), static_cast<QAbstractItemView*>(grid_view),
+          static_cast<QAbstractItemView*>(carousel_view)}) {
+        connect(view, &QAbstractItemView::doubleClicked, this, &GameList::ValidateEntry);
+        connect(view, &QAbstractItemView::clicked, this, &GameList::OnItemClicked);
+        connect(view, &QWidget::customContextMenuRequested, this, &GameList::PopupContextMenu);
+        // Wait for the selection to settle so holding an arrow key doesn't load every game.
+        connect(view->selectionModel(), &QItemSelectionModel::currentChanged, this, [this] {
+            if (details_panel->isVisible() && details_panel->maximumWidth() > 0) {
+                details_timer->start();
+            }
+        });
+        view->installEventFilter(this);
+    }
 
     connect(controller_navigation, &ControllerNavigation::TriggerKeyboardEvent, this,
             [this](Qt::Key key) {
@@ -139,6 +376,7 @@ void GameList::SetFilterFocus() {
 
 void GameList::SetFilterVisible(bool visibility) {
     search_field->setVisible(visibility);
+    surface->SetFilterZoneVisible(visibility);
 }
 
 bool GameList::IsEmpty() const {
@@ -237,6 +475,9 @@ void GameList::ResetViewMode() {
 
     QScroller::grabGesture(view, QScroller::LeftMouseButtonGesture);
 
+    // The banner backdrop belongs to the carousel; leaving the mode must repaint it away.
+    surface->update();
+
     auto scroller = QScroller::scroller(view);
     QScrollerProperties props;
     props.setScrollMetric(QScrollerProperties::HorizontalOvershootPolicy,
@@ -252,6 +493,573 @@ void GameList::ResetViewMode() {
             item_model->PopulateAsync(UISettings::values.game_dirs);
         }
     }
+
+    if (customize_panel) {
+        customize_panel->SyncFromSettings();
+    }
+}
+
+void GameList::SetupCustomization() {
+    customize_panel = new HomeCustomizePanel(background, this);
+    customize_panel->setMaximumWidth(0);
+    customize_panel->hide();
+    outer_layout->addWidget(customize_panel);
+
+    customize_animation = MakeSlideAnimation(customize_panel);
+
+    connect(customize_panel, &HomeCustomizePanel::CloseRequested, this,
+            [this] { ShowCustomizePanel(false); });
+    connect(customize_panel, &HomeCustomizePanel::BackgroundChosen, this,
+            &GameList::SetHomeBackground);
+    connect(customize_panel, &HomeCustomizePanel::RecentBackgroundRemoved, this,
+            &GameList::RemoveRecentBackground);
+
+    // Applies the saved background: the saved picture file for the picture kind, or the saved
+    // colors for a solid or gradient fill.
+    const auto saved_color = [](const Setting<std::string>& setting) {
+        return HomeBackground::ColorFromString(QString::fromStdString(setting.GetValue()));
+    };
+    const auto apply_background = [this, saved_color](HomeBackground::Kind kind) {
+        switch (kind) {
+        case HomeBackground::Kind::Solid:
+            background->SetSolid(saved_color(UISettings::values.home_background_color));
+            break;
+        case HomeBackground::Kind::Gradient:
+            background->SetGradient(saved_color(UISettings::values.home_background_color),
+                                     saved_color(UISettings::values.home_background_color2));
+            break;
+        case HomeBackground::Kind::Picture: {
+            const QString saved =
+                QString::fromStdString(UISettings::values.home_background.GetValue());
+            if (!saved.isEmpty() && !background->SetSource(saved)) {
+                LOG_WARNING(Frontend, "Home screen background {} could not be loaded",
+                            saved.toStdString());
+            }
+            break;
+        }
+        }
+        UpdateViewTransparency();
+    };
+    connect(customize_panel, &HomeCustomizePanel::BackgroundKindRequested, this,
+            [this, apply_background](HomeBackground::Kind kind) {
+                UISettings::values.home_background_kind = static_cast<u8>(kind);
+                apply_background(kind);
+                customize_panel->SyncFromSettings();
+                emit SaveConfig();
+            });
+    connect(customize_panel, &HomeCustomizePanel::BackgroundColorRequested, this,
+            [this, apply_background](int index, const QColor& color) {
+                auto& setting = index == 1 ? UISettings::values.home_background_color2
+                                           : UISettings::values.home_background_color;
+                setting = color.name().toStdString();
+                apply_background(HomeBackground::KindFromInt(
+                    UISettings::values.home_background_kind.GetValue()));
+                customize_panel->SyncFromSettings();
+                emit SaveConfig();
+            });
+    connect(customize_panel, &HomeCustomizePanel::GameListModeRequested, this,
+            &GameList::GameListModeRequested);
+    connect(customize_panel, &HomeCustomizePanel::GameIconSizeRequested, this,
+            &GameList::GameIconSizeRequested);
+    connect(customize_panel, &HomeCustomizePanel::GameIconBordersRequested, this,
+            [this](bool show) {
+                UISettings::values.game_icon_borders = show;
+                grid_view->UpdateIconSize();
+                carousel_view->viewport()->update();
+            });
+    connect(customize_panel, &HomeCustomizePanel::CartridgeKindRequested, this,
+            [this](u8 kind) {
+                UISettings::values.game_cartridge_kind = kind;
+                grid_view->UpdateIconSize();
+                carousel_view->viewport()->update();
+                emit SaveConfig();
+            });
+    connect(customize_panel, &HomeCustomizePanel::CarouselCardSizeRequested, this,
+            [this](u8 index) {
+                UISettings::values.carousel_card_size = index;
+                carousel_view->viewport()->update();
+                emit SaveConfig();
+            });
+    connect(customize_panel, &HomeCustomizePanel::CarouselSideCountRequested, this,
+            [this](u8 count) {
+                UISettings::values.carousel_side_count = count;
+                carousel_view->viewport()->update();
+                emit SaveConfig();
+            });
+    connect(customize_panel, &HomeCustomizePanel::CarouselBannerBackgroundRequested, this,
+            [this](bool show) {
+                UISettings::values.carousel_banner_background = show;
+                surface->SetBannerGame(carousel_view->CenteredProgramId());
+                carousel_view->viewport()->update();
+                emit SaveConfig();
+            });
+    // The backdrop follows the carousel's centered game, including a slide's destination.
+    connect(carousel_view, &GameCarousel::CenteredGameChanged, surface,
+            &HomeSurface::SetBannerGame);
+
+    customize_button = new FloatingActionButton(surface);
+    customize_button->setToolTip(tr("Customize Home Screen"));
+    RefreshCustomizeButtonIcon();
+    connect(customize_button, &QAbstractButton::clicked, this, [this] {
+        ShowCustomizePanel(!(customize_panel->isVisible() && customize_panel->maximumWidth() > 0));
+    });
+    surface->installEventFilter(this);
+    search_field->installEventFilter(this);
+    PlaceCustomizeButton();
+
+    // Restore the saved background kind, and with it the saved picture when it is the kind.
+    apply_background(
+        HomeBackground::KindFromInt(UISettings::values.home_background_kind.GetValue()));
+}
+
+void GameList::PlaceCustomizeButton() {
+    constexpr int Margin = 20;
+    const int bottom = search_field->isVisible() ? search_field->geometry().top() : surface->height();
+    customize_button->move(surface->width() - customize_button->width() - Margin,
+                           bottom - customize_button->height() - Margin / 2);
+    customize_button->raise();
+}
+
+void GameList::RefreshCustomizeButtonIcon() {
+    customize_button->setIcon(HomeGlyphs::Brush(palette().color(QPalette::HighlightedText),
+                                                devicePixelRatioF(), 24));
+}
+
+QPropertyAnimation* GameList::MakeSlideAnimation(QWidget* panel) {
+    auto* animation = new QPropertyAnimation(panel, "maximumWidth", this);
+    animation->setDuration(180);
+    animation->setEasingCurve(QEasingCurve::OutCubic);
+    connect(animation, &QPropertyAnimation::valueChanged, this, [this] {
+        if (panels_overlay) {
+            UpdatePanelPlacement();
+        }
+    });
+    connect(animation, &QPropertyAnimation::finished, this, [this, panel] {
+        if (panel->maximumWidth() == 0) {
+            const bool had_focus = panel->isAncestorOf(QApplication::focusWidget());
+            panel->hide();
+            if (had_focus) {
+                m_currentView->setFocus();
+            }
+        }
+    });
+    return animation;
+}
+
+void GameList::UpdatePanelPlacement() {
+    // Below this width, docking a sidebar would leave too little room for the games.
+    constexpr int OverlayBelowWidth = 900;
+    const bool overlay = width() < OverlayBelowWidth;
+    if (overlay != panels_overlay) {
+        panels_overlay = overlay;
+        for (QWidget* panel : {static_cast<QWidget*>(customize_panel),
+                               static_cast<QWidget*>(details_panel)}) {
+            if (overlay) {
+                outer_layout->removeWidget(panel);
+            } else {
+                outer_layout->addWidget(panel);
+            }
+        }
+    }
+    if (!panels_overlay) {
+        return;
+    }
+    for (QWidget* panel :
+         {static_cast<QWidget*>(customize_panel), static_cast<QWidget*>(details_panel)}) {
+        if (panel->isVisible()) {
+            const int panel_width = std::min(panel->maximumWidth(), HomeSidePanel::PanelWidth);
+            panel->setGeometry(width() - panel_width, 0, panel_width, height());
+            panel->raise();
+        }
+    }
+}
+
+void GameList::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    if (customize_panel && details_panel) {
+        UpdatePanelPlacement();
+    }
+}
+
+void GameList::SlidePanel(QWidget* panel, QPropertyAnimation* animation, int width) {
+    if (width > 0) {
+        panel->show();
+        UpdatePanelPlacement();
+    } else if (panel->isHidden()) {
+        return;
+    }
+    animation->stop();
+    animation->setStartValue(panel->maximumWidth());
+    animation->setEndValue(width);
+    animation->start();
+}
+
+void GameList::ShowCustomizePanel(bool show) {
+    if (show) {
+        HideGameDetails();
+        customize_panel->SyncFromSettings();
+        customize_panel->show();
+        customize_panel->setFocus();
+    }
+    SlidePanel(customize_panel, customize_animation, show ? HomeCustomizePanel::PanelWidth : 0);
+}
+
+void GameList::SetupGameDetails() {
+    details_panel = new GameDetailsPanel(this);
+    details_panel->setMaximumWidth(0);
+    details_panel->hide();
+    outer_layout->addWidget(details_panel);
+    details_animation = MakeSlideAnimation(details_panel);
+
+    details_timer = new QTimer(this);
+    details_timer->setSingleShot(true);
+    details_timer->setInterval(120);
+    connect(details_timer, &QTimer::timeout, this, [this] {
+        const QModelIndex current = m_currentView->currentIndex();
+        if (current.isValid() && current.sibling(current.row(), 0) != details_index &&
+            details_panel->isVisible() && details_panel->maximumWidth() > 0) {
+            ShowGameDetails(current);
+        }
+    });
+    details_pool = new QThreadPool(this);
+    details_pool->setMaxThreadCount(1);
+
+    connect(details_panel, &GameDetailsPanel::CloseRequested, this, &GameList::HideGameDetails);
+    connect(details_panel, &GameDetailsPanel::PlayRequested, this, [this] {
+        if (details_index.isValid()) {
+            ValidateEntry(details_index);
+        }
+    });
+    connect(details_panel, &GameDetailsPanel::ConfigureRequested, this, [this] {
+        emit OpenPerGameGeneralRequested(details_panel->Game().path.toStdString());
+        // The dialog is modal: refresh the custom settings and add-on state it may have changed.
+        if (details_index.isValid()) {
+            LoadGameDetailsExtras();
+        }
+    });
+    connect(details_panel, &GameDetailsPanel::OpenLocationRequested, this, [this] {
+        emit OpenDirectory(QFileInfo(details_panel->Game().path).absolutePath());
+    });
+    connect(details_panel, &GameDetailsPanel::PrecompileShadersRequested, this, [this] {
+        const GameDetailsInfo& game = details_panel->Game();
+        emit PrepareShaderWarmRequested(game.program_id, game.path.toStdString());
+        if (details_index.isValid()) {
+            LoadGameDetailsExtras();
+        }
+    });
+    connect(details_panel, &GameDetailsPanel::DisabledAddOnsChanged, this,
+            [this](const QStringList& disabled) {
+                const u64 program_id = details_panel->Game().program_id;
+                if (program_id == 0) {
+                    return;
+                }
+                std::vector<std::string> list;
+                for (const QString& key : disabled) {
+                    list.push_back(key.toStdString());
+                }
+                Settings::values.disabled_addons[program_id] = std::move(list);
+                Common::FS::RemoveFile(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
+                                       "game_list" / fmt::format("{:016X}.pv.txt", program_id));
+                add_ons_changed = true;
+                emit SaveConfig();
+            });
+    connect(details_panel, &GameDetailsPanel::FavoriteToggled, this,
+            [this] { ToggleFavorite(details_panel->Game().program_id); });
+    connect(details_panel, &GameDetailsPanel::MoreRequested, this, [this](const QPoint& pos) {
+        const GameDetailsInfo& game = details_panel->Game();
+        QMenu menu;
+        AddGamePopup(menu, game.program_id, game.path.toStdString());
+        menu.exec(pos);
+    });
+    connect(details_panel, &GameDetailsPanel::IconChanged, this, &GameList::UpdateGameIcon);
+    // A saved or removed banner changes the backdrop pixels without changing the centered game.
+    connect(details_panel, &GameDetailsPanel::HeroChanged, this,
+            [this](u64) { surface->RefreshBanner(); });
+}
+
+void GameList::ShowGameDetailsForPath(const QString& path) {
+    pending_details_path = path;
+    RevealPendingGame();
+}
+
+QModelIndex GameList::FindGame(const QString& path) const {
+    // Loose dumps boot <dir>/main while the list holds <dir>.
+    const auto matches = [&](const QString& item_path) {
+        return !item_path.isEmpty() &&
+               (item_path == path || path.startsWith(item_path + QLatin1Char('/')) ||
+                path.startsWith(item_path + QLatin1Char('\\')));
+    };
+    QModelIndex favorite_match;
+    const std::function<QModelIndex(QStandardItem*, bool)> visit =
+        [&](QStandardItem* parent, bool in_favorites) -> QModelIndex {
+        for (int row = 0; row < parent->rowCount(); ++row) {
+            QStandardItem* child = parent->child(row, 0);
+            if (!child) {
+                continue;
+            }
+            const auto type = child->data(GameListItem::TypeRole).value<GameListItemType>();
+            if (type == GameListItemType::Game &&
+                matches(child->data(GameListItemPath::FullPathRole).toString())) {
+                // Prefer the row under its directory over the copy under Favorites.
+                if (!in_favorites) {
+                    return child->index();
+                }
+                if (!favorite_match.isValid()) {
+                    favorite_match = child->index();
+                }
+            }
+            if (const QModelIndex found =
+                    visit(child, in_favorites || type == GameListItemType::Favorites);
+                found.isValid()) {
+                return found;
+            }
+        }
+        return {};
+    };
+    const QModelIndex found = visit(item_model->invisibleRootItem(), false);
+    return found.isValid() ? found : favorite_match;
+}
+
+bool GameList::RevealPendingGame() {
+    if (pending_details_path.isEmpty()) {
+        return false;
+    }
+    const QModelIndex index = FindGame(pending_details_path);
+    if (!index.isValid()) {
+        return false;
+    }
+    m_currentView->setCurrentIndex(index);
+    m_currentView->scrollTo(index);
+    ShowGameDetails(index);
+    return true;
+}
+
+void GameList::OnItemClicked(const QModelIndex& index) {
+    pending_details_path.clear();
+    const auto type = index.sibling(index.row(), 0).data(GameListItem::TypeRole);
+    if (type.value<GameListItemType>() == GameListItemType::Game) {
+        ShowGameDetails(index);
+    }
+}
+
+void GameList::ShowGameDetails(const QModelIndex& index) {
+    const QModelIndex selected = index.sibling(index.row(), 0);
+    if (selected.data(GameListItem::TypeRole).value<GameListItemType>() != GameListItemType::Game) {
+        return;
+    }
+    const auto column_text = [&](int column) {
+        return selected.sibling(selected.row(), column).data(Qt::DisplayRole).toString().trimmed();
+    };
+
+    GameDetailsInfo info;
+    info.path = selected.data(GameListItemPath::FullPathRole).toString();
+    info.program_id = selected.data(GameListItemPath::ProgramIdRole).toULongLong();
+    info.title = selected.data(GameListItemPath::TitleRole).toString().trimmed();
+    if (info.title.isEmpty()) {
+        info.title = QFileInfo(info.path).completeBaseName();
+    }
+    info.developer = selected.data(GameListItemPath::DeveloperRole).toString().trimmed();
+    info.version = selected.data(GameListItemPath::VersionRole).toString();
+    info.file_type = column_text(GameListModel::COLUMN_FILE_TYPE);
+    info.size = column_text(GameListModel::COLUMN_SIZE);
+    info.play_time = column_text(GameListModel::COLUMN_PLAY_TIME);
+    info.favorite = UISettings::values.favorited_ids.contains(info.program_id);
+    // Prefer the full-size custom icon; list icons are scaled down to the icon size setting.
+    if (QtCommon::GameArt::HasIcon(info.program_id)) {
+        info.icon.load(QtCommon::GameArt::IconPath(info.program_id));
+    }
+    if (info.icon.isNull()) {
+        info.icon = selected.data(Qt::DecorationRole).value<QPixmap>();
+    }
+
+    details_index = selected;
+    details_panel->SetGame(info);
+    LoadGameDetailsExtras();
+    if (customize_panel->isVisible()) {
+        ShowCustomizePanel(false);
+    }
+    SlidePanel(details_panel, details_animation, GameDetailsPanel::PanelWidth);
+}
+
+void GameList::LoadGameDetailsExtras() {
+    const GameDetailsInfo& game = details_panel->Game();
+    const u64 program_id = game.program_id;
+    const QString path = game.path;
+    if (program_id == 0) {
+        details_panel->SetExtras(GameDetailsExtras{.program_id = program_id, .path = path});
+        return;
+    }
+
+    std::vector<std::string> disabled;
+    if (const auto it = Settings::values.disabled_addons.find(program_id);
+        it != Settings::values.disabled_addons.end()) {
+        disabled = it->second;
+    }
+
+    details_pool->start([guard = QPointer<GameList>(this), vfs_ = vfs, &system_ = system,
+                         program_id, path, disabled = std::move(disabled)] {
+        GameDetailsExtras extras{.program_id = program_id, .path = path};
+
+        FileSys::VirtualFile update_raw;
+        if (const auto file = Core::GetGameFileFromPath(vfs_, path.toStdString())) {
+            if (const auto loader = Loader::GetLoader(system_, file)) {
+                loader->ReadUpdateRaw(update_raw);
+            }
+        }
+        const FileSys::PatchManager patch_manager{program_id, system_.GetFileSystemController(),
+                                                  system_.GetContentProvider()};
+        // Same rules as the per-game Add-Ons tab: one update at most is enabled.
+        bool has_enabled_update = false;
+        for (const auto& patch : patch_manager.GetPatches(update_raw)) {
+            GameAddOn add_on;
+            add_on.name = QString::fromStdString(patch.name);
+            add_on.version = QString::fromStdString(patch.version);
+            add_on.is_update = patch.type == FileSys::PatchType::Update;
+            const bool external_update = add_on.is_update &&
+                                         patch.source == FileSys::PatchSource::External &&
+                                         patch.numeric_version != 0;
+            add_on.key = external_update
+                             ? QStringLiteral("Update@%1").arg(patch.numeric_version)
+                             : add_on.name;
+            add_on.enabled = std::find(disabled.begin(), disabled.end(),
+                                       add_on.key.toStdString()) == disabled.end();
+            if (add_on.is_update && add_on.enabled) {
+                add_on.enabled = !has_enabled_update;
+                has_enabled_update = true;
+            }
+            extras.add_ons.push_back(std::move(add_on));
+        }
+
+        std::error_code ec;
+        const auto cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
+                               fmt::format("{:016x}", program_id);
+        for (auto it = std::filesystem::recursive_directory_iterator(cache_dir, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (it->is_regular_file(ec)) {
+                const auto size = it->file_size(ec);
+                if (!ec) {
+                    extras.pipeline_cache_bytes += size;
+                }
+            }
+        }
+        extras.shaders_precompiled = ShaderWarmFilesExist(program_id);
+        extras.custom_config = Common::FS::Exists(
+            Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "custom" /
+            fmt::format("{:016X}.ini", program_id));
+
+        QMetaObject::invokeMethod(qApp, [guard, extras = std::move(extras)] {
+            if (guard) {
+                guard->details_panel->SetExtras(extras);
+            }
+        });
+    });
+}
+
+void GameList::HideGameDetails() {
+    pending_details_path.clear();
+    details_index = QPersistentModelIndex{};
+    details_timer->stop();
+    SlidePanel(details_panel, details_animation, 0);
+    // The Add-ons column only picks up toggles made in the sidebar on a rescan.
+    if (add_ons_changed) {
+        add_ons_changed = false;
+        RefreshGameDirectory();
+    }
+}
+
+void GameList::UpdateGameIcon(u64 program_id) {
+    const u32 size = UISettings::values.game_icon_size.GetValue();
+    QPixmap custom;
+    if (QtCommon::GameArt::HasIcon(program_id)) {
+        custom.load(QtCommon::GameArt::IconPath(program_id));
+        if (!custom.isNull()) {
+            custom = custom.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        }
+    }
+
+    // The same game can appear under its directory and under Favorites.
+    const std::function<void(QStandardItem*)> visit = [&](QStandardItem* parent) {
+        for (int row = 0; row < parent->rowCount(); ++row) {
+            QStandardItem* child = parent->child(row, 0);
+            if (!child) {
+                continue;
+            }
+            if (child->type() == static_cast<int>(GameListItemType::Game) &&
+                child->data(GameListItemPath::ProgramIdRole).toULongLong() == program_id) {
+                child->setData(custom.isNull() ? child->data(GameListItemPath::OriginalIconRole)
+                                               : QVariant(custom),
+                               Qt::DecorationRole);
+            }
+            visit(child);
+        }
+    };
+    visit(item_model->invisibleRootItem());
+
+    if (details_index.isValid() && details_panel->Game().program_id == program_id) {
+        QPixmap icon;
+        if (QtCommon::GameArt::HasIcon(program_id)) {
+            icon.load(QtCommon::GameArt::IconPath(program_id));
+        }
+        if (icon.isNull()) {
+            icon = details_index.data(Qt::DecorationRole).value<QPixmap>();
+        }
+        details_panel->SetIcon(icon);
+    }
+}
+
+void GameList::SetHomeBackground(const QString& path) {
+    if (!background->SetSource(path)) {
+        QMessageBox::warning(this, tr("Home Screen"),
+                             HomeBackground::IsVideo(path)
+                                 ? tr("Video backgrounds need a build with QtMultimedia.")
+                                 : tr("\"%1\" could not be loaded as a background.")
+                                       .arg(QFileInfo(path).fileName()));
+        return;
+    }
+
+    UISettings::values.home_background.SetValue(path.toStdString());
+    if (!path.isEmpty()) {
+        constexpr qsizetype MaxRecentBackgrounds = 8;
+        auto& recents = UISettings::values.recent_home_backgrounds;
+        recents.removeAll(path);
+        recents.prepend(path);
+        while (recents.size() > MaxRecentBackgrounds) {
+            recents.removeLast();
+        }
+    }
+
+    UpdateViewTransparency();
+    customize_panel->SyncFromSettings();
+    emit SaveConfig();
+}
+
+void GameList::RemoveRecentBackground(const QString& path) {
+    UISettings::values.recent_home_backgrounds.removeAll(path);
+    customize_panel->SyncFromSettings();
+    emit SaveConfig();
+}
+
+void GameList::UpdateViewTransparency() {
+    if (background->IsEmpty()) {
+        tree_view->setStyleSheet(QStringLiteral("QTreeView{ border: none; }"));
+        grid_view->setStyleSheet({});
+        carousel_view->setStyleSheet({});
+        return;
+    }
+
+    QColor alternate = palette().color(QPalette::AlternateBase);
+    alternate.setAlpha(110);
+    tree_view->setStyleSheet(
+        QStringLiteral("QTreeView{ border: none; background: transparent; "
+                       "alternate-background-color: rgba(%1, %2, %3, %4); }")
+            .arg(alternate.red())
+            .arg(alternate.green())
+            .arg(alternate.blue())
+            .arg(alternate.alpha()));
+    const QString list_style =
+        QStringLiteral("QListView{ border: none; background: transparent; }");
+    grid_view->setStyleSheet(list_style);
+    carousel_view->setStyleSheet(list_style);
 }
 
 void GameList::OnTextChanged(const QString& new_text) {
@@ -305,7 +1113,8 @@ void GameList::OnPopulatingCompleted(const QStringList& watch_list) {
 
     QStringList to_remove, to_add;
 
-    const auto slice = [&](const QStringList& list, std::function<void(const QStringList&)> callback) {
+    const auto slice = [&](const QStringList& list,
+                           std::function<void(const QStringList&)> callback) {
         const int len = (std::min)(list.size(), LIMIT_WATCH_DIRECTORIES);
         for (int i = 0; i < len; i += SLICE_SIZE) {
             auto chunk = list.mid(i, SLICE_SIZE);
@@ -335,6 +1144,14 @@ void GameList::OnPopulatingCompleted(const QStringList& watch_list) {
 
     m_populating = false;
     m_currentView->setEnabled(true);
+
+    // A repopulate replaces every row: reopen the game that was asked for, or close the
+    // sidebar since the game it showed is gone.
+    if (RevealPendingGame()) {
+        pending_details_path.clear();
+    } else if (details_panel->isVisible() && !details_index.isValid()) {
+        HideGameDetails();
+    }
 
     int children_total = 0;
     for (int i = 1; i < item_model->rowCount() - 1; ++i) {
@@ -368,6 +1185,10 @@ void GameList::RefreshExternalContent() {
 }
 
 void GameList::UpdateIconSizes() {
+    if (customize_panel) {
+        customize_panel->SyncFromSettings();
+    }
+
     switch (game_list_mode) {
     case Settings::GameListMode::GridView:
         grid_view->UpdateIconSize();
@@ -417,6 +1238,9 @@ void GameList::ValidateEntry(const QModelIndex& item) {
 
 void GameList::ToggleFavorite(u64 program_id) {
     item_model->ToggleFavorite(program_id);
+    if (details_panel && details_panel->Game().program_id == program_id) {
+        details_panel->SetFavorite(UISettings::values.favorited_ids.contains(program_id));
+    }
 
     if (UISettings::values.favorited_ids.contains(program_id)) {
         tree_view->setRowHidden(0, item_model->invisibleRootItem()->index(),
@@ -433,13 +1257,14 @@ void GameList::ToggleFavorite(u64 program_id) {
 void GameList::PopupContextMenu(const QPoint& menu_location) {
     QModelIndex item = m_currentView->indexAt(menu_location);
     if (!item.isValid()) {
-        if (m_isTreeMode)
-            return;
-
         QMenu blank_menu;
-        QAction* addGameDirAction = blank_menu.addAction(tr("&Add New Game Directory"));
-
-        connect(addGameDirAction, &QAction::triggered, this, &GameList::AddDirectory);
+        if (!m_isTreeMode) {
+            QAction* addGameDirAction = blank_menu.addAction(tr("&Add New Game Directory"));
+            connect(addGameDirAction, &QAction::triggered, this, &GameList::AddDirectory);
+            blank_menu.addSeparator();
+        }
+        QAction* customize = blank_menu.addAction(tr("&Customize Home Screen..."));
+        connect(customize, &QAction::triggered, this, [this] { ShowCustomizePanel(true); });
         blank_menu.exec(m_currentView->viewport()->mapToGlobal(menu_location));
         return;
     }
@@ -506,6 +1331,13 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     const bool is_nup_archive =
         !FileSys::Nup::DumpRootFromMain(path) &&
         QString::fromStdString(path).endsWith(QStringLiteral(".nup"), Qt::CaseInsensitive);
+    // Music extraction reads the Alto-family Sound tree straight out of a NUP archive or a
+    // loose dump; other content types (installed NSPs, XCI) are not supported.
+    QAction* extract_music = nullptr;
+    if (is_nup_archive || FileSys::Nup::DumpRootFromMain(path)) {
+        extract_music = context_menu.addAction(tr("Dump Audio"));
+        extract_music->setEnabled(!nup_conversion_running);
+    }
     QAction* extract_nup = nullptr;
     if (is_nup_archive) {
         extract_nup = context_menu.addAction(tr("Dump NUP..."));
@@ -630,6 +1462,10 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         connect(extract_nup, &QAction::triggered, this,
                 [this, path]() { emit ExtractNupRequested(path); });
     }
+    if (extract_music) {
+        connect(extract_music, &QAction::triggered, this,
+                [this, path]() { emit ExtractMusicRequested(path); });
+    }
     if (edit_nup) {
         connect(edit_nup, &QAction::triggered, this,
                 [this, path]() { emit EditNupMetadataRequested(path); });
@@ -730,6 +1566,11 @@ void GameList::AddFavoritesPopup(QMenu& context_menu) {
 void GameList::changeEvent(QEvent* event) {
     if (event->type() == QEvent::LanguageChange) {
         RetranslateUI();
+    } else if (event->type() == QEvent::PaletteChange && background) {
+        UpdateViewTransparency();
+        if (customize_button) {
+            RefreshCustomizeButtonIcon();
+        }
     }
 
     QWidget::changeEvent(event);
@@ -758,6 +1599,61 @@ void GameList::SetupScrollAnimation() {
 }
 
 bool GameList::eventFilter(QObject* obj, QEvent* event) {
+    if (customize_button && (obj == surface || obj == search_field)) {
+        switch (event->type()) {
+        case QEvent::Resize:
+        case QEvent::Move:
+        case QEvent::Show:
+        case QEvent::Hide:
+            PlaceCustomizeButton();
+            break;
+        default:
+            break;
+        }
+    }
+    if (!m_currentView) {
+        return QWidget::eventFilter(obj, event);
+    }
+    if (obj == m_currentView && event->type() == QEvent::KeyPress) {
+        const auto* key_event = static_cast<QKeyEvent*>(event);
+        switch (key_event->key()) {
+        case Qt::Key_Return:
+        case Qt::Key_Enter:
+            if (m_currentView->currentIndex().isValid()) {
+                ValidateEntry(m_currentView->currentIndex());
+                return true;
+            }
+            break;
+        case Qt::Key_Escape:
+            if (details_panel->isVisible()) {
+                HideGameDetails();
+                return true;
+            }
+            break;
+        // Sent by controller Y and X.
+        case Qt::Key_Favorites:
+        case Qt::Key_Settings: {
+            const QModelIndex current = m_currentView->currentIndex();
+            const QModelIndex game = current.sibling(current.row(), 0);
+            if (!game.isValid() || game.data(GameListItem::TypeRole).value<GameListItemType>() !=
+                                       GameListItemType::Game) {
+                break;
+            }
+            if (key_event->key() == Qt::Key_Favorites) {
+                if (const u64 id = game.data(GameListItemPath::ProgramIdRole).toULongLong()) {
+                    ToggleFavorite(id);
+                }
+            } else {
+                emit OpenPerGameGeneralRequested(
+                    game.data(GameListItemPath::FullPathRole).toString().toStdString());
+            }
+            return true;
+        }
+        default:
+            break;
+        }
+    }
+
     if (obj == m_currentView->viewport() && event->type() == QEvent::Wheel) {
         QWheelEvent* wheelEvent = static_cast<QWheelEvent*>(event);
 
@@ -809,6 +1705,7 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
         if (!index.isValid()) {
             m_currentView->selectionModel()->clearSelection();
             m_currentView->setCurrentIndex(QModelIndex());
+            HideGameDetails();
         }
     }
 

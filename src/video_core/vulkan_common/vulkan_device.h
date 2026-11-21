@@ -1084,6 +1084,9 @@ FN_MAX_LIMIT_LIST
 
     u64 GetDeviceMemoryUsage() const;
 
+    /// Size of the main device-local heap (EDEN_NX2_VRAM_LIMIT_MIB applied).
+    u64 GetMainHeapSize() const;
+
     /// The driver's current memory budget for this process (VK_EXT_memory_budget), in
     /// GetDeviceMemoryUsage() terms: the usage at which the main device-local heap reaches its
     /// budget. 0 without the extension. The unused part of the allocator's blocks is not

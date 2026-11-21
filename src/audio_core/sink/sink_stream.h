@@ -187,6 +187,15 @@ public:
     virtual std::vector<s16> ReleaseBuffer(u64 num_samples);
 
     /**
+     * Take recorded samples out of the stream without the input gain ReleaseBuffer applies.
+     * Switch 2 sysmix input streams carry the capture device as-is; the game sets its own gain.
+     *
+     * @param num_samples - Number of samples wanted, zero-padded when fewer are buffered.
+     * @return Vector of recorded samples, exactly num_samples long.
+     */
+    std::vector<s16> PopSamples(u64 num_samples);
+
+    /**
      * Empty out the buffer queue.
      */
     void ClearQueue();

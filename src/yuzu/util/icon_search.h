@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,12 @@ enum class IconSearchStatus {
     InternalError,
 };
 
+// What a SteamGridDB-only search looks for.
+enum class SgdbArtKind {
+    Icon,
+    Hero,
+};
+
 struct IconSearchResult {
     IconSearchStatus status{IconSearchStatus::NotFound};
     std::vector<u8> icon_bytes;
@@ -50,14 +57,19 @@ public:
     ~IconSearch() override;
 
     void Start(const QString& name, u64 title_id = 0);
+    // Searches SteamGridDB only and always lets the user pick, for the game details sidebar.
+    void StartSteamGridDb(const QString& name, u64 title_id, SgdbArtKind kind);
     bool IsRunning() const;
 
 signals:
     void RunningChanged(bool running);
     // A 256x256 PNG, and the canonical title when the name was an alias (else empty).
     void IconSelected(const QByteArray& png, const QString& resolved_title);
+    // A wide banner image (JPEG, at most HeroMaxWidth wide).
+    void HeroSelected(const QByteArray& image);
 
 private:
+    void Run(const QString& name, u64 title_id, std::optional<SgdbArtKind> kind);
     void OnFinished();
     int ChooseIcon(const std::vector<std::vector<u8>>& choices);
     bool AskForApiKey(bool missing);
@@ -67,4 +79,5 @@ private:
     std::shared_ptr<std::atomic_bool> cancel_flag{std::make_shared<std::atomic_bool>(false)};
     QString last_name;
     u64 last_title_id{};
+    std::optional<SgdbArtKind> sgdb_kind;
 };

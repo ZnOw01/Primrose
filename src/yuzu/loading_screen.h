@@ -20,10 +20,6 @@ namespace Loader {
 class AppLoader;
 }
 
-namespace Ui {
-class LoadingScreen;
-}
-
 namespace VideoCore {
 enum class LoadCallbackStage;
 }
@@ -31,8 +27,11 @@ enum class LoadCallbackStage;
 class QBuffer;
 class QByteArray;
 class QGraphicsOpacityEffect;
+class QLabel;
 class QMovie;
 class QPropertyAnimation;
+class LoadingProgressBar;
+class LoadingBackdrop;
 
 class LoadingScreen : public QWidget {
     Q_OBJECT
@@ -42,8 +41,8 @@ public:
 
     ~LoadingScreen();
 
-    /// Call before showing the loading screen to load the widgets with the logo and banner for the
-    /// currently loaded application.
+    /// Call before showing the loading screen to load the widgets with the icon, title, logo and
+    /// banner for the currently loaded application.
     void Prepare(Loader::AppLoader& loader);
 
     /// After the loading screen is hidden, the owner of this class can call this to clean up any
@@ -56,40 +55,52 @@ public:
     /// Hides the LoadingScreen with a fade out effect
     void OnLoadComplete();
 
-    // In order to use a custom widget with a stylesheet, you need to override the paintEvent
-    // See https://wiki.qt.io/How_to_Change_the_Background_Color_of_QWidget
-    void paintEvent(QPaintEvent* event) override;
-
 signals:
     void LoadProgress(VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total);
     /// Signals that this widget is completely hidden now and should be replaced with the other
     /// widget
     void Hidden();
 
+protected:
+    void paintEvent(QPaintEvent* event) override;
+    void changeEvent(QEvent* event) override;
+
 private:
+    using Clock = std::chrono::steady_clock;
+
+    void ApplyPalette();
+    void ShowBusy(const QString& text);
+    void UpdateBuildText(std::size_t value, std::size_t total, Clock::time_point now);
+    QString FormatRemaining(std::chrono::seconds remaining) const;
+
 #ifndef YUZU_QT_MOVIE_MISSING
     std::unique_ptr<QMovie> animation;
     std::unique_ptr<QBuffer> backing_buf;
     std::unique_ptr<QByteArray> backing_mem;
 #endif
-    std::unique_ptr<Ui::LoadingScreen> ui;
-    std::size_t previous_total = 0;
-    VideoCore::LoadCallbackStage previous_stage;
+
+    LoadingBackdrop* fade_parent = nullptr;
+    QLabel* logo = nullptr;
+    QLabel* icon = nullptr;
+    QLabel* title = nullptr;
+    QLabel* stage_label = nullptr;
+    LoadingProgressBar* progress_bar = nullptr;
+    QLabel* detail = nullptr;
+    QLabel* banner = nullptr;
 
     QGraphicsOpacityEffect* opacity_effect = nullptr;
     std::unique_ptr<QPropertyAnimation> fadeout_animation;
 
-    // Definitions for the differences in text and styling for each stage
-    ::Common::unordered_map<VideoCore::LoadCallbackStage, const char*> progressbar_style;
-    ::Common::unordered_map<VideoCore::LoadCallbackStage, QString> stage_translations;
+    VideoCore::LoadCallbackStage previous_stage;
 
-    // newly generated shaders are added to the end of the file, so when loading and compiling
-    // shaders, it will start quickly but end slow if new shaders were added since previous launch.
-    // These variables are used to detect the change in speed so we can generate an ETA
-    bool slow_shader_compile_start = false;
-    std::chrono::steady_clock::time_point slow_shader_start;
-    std::chrono::steady_clock::time_point previous_time;
-    std::size_t slow_shader_first_value = 0;
+    // Build stage timing. The rate is an exponential moving average over samples at least
+    // RateSampleInterval apart, which keeps the estimate from jumping between cheap cached
+    // pipelines and expensive new ones.
+    Clock::time_point build_start;
+    Clock::time_point last_sample_time;
+    Clock::time_point last_text_update;
+    std::size_t last_sample_value = 0;
+    double pipelines_per_second = 0.0;
 };
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)

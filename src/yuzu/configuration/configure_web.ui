@@ -153,6 +153,49 @@
     </widget>
    </item>
    <item>
+    <widget class="QGroupBox" name="steamgriddb_group">
+     <property name="title">
+      <string>SteamGridDB</string>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayoutSteamGridDb">
+      <item>
+       <widget class="QLabel" name="label_steamgriddb_info">
+        <property name="text">
+         <string>Used to find game banners and icons. Create a free key on the &lt;a href=&quot;https://www.steamgriddb.com/profile/preferences/api&quot;&gt;SteamGridDB API preferences&lt;/a&gt; page.</string>
+        </property>
+        <property name="textFormat">
+         <enum>Qt::TextFormat::RichText</enum>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+        <property name="openExternalLinks">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="horizontalLayoutSteamGridDb">
+        <item>
+         <widget class="QLabel" name="label_steamgriddb_key">
+          <property name="text">
+           <string>API key: </string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLineEdit" name="edit_steamgriddb_key">
+          <property name="echoMode">
+           <enum>QLineEdit::EchoMode::Password</enum>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
     <spacer name="verticalSpacer">
      <property name="orientation">
       <enum>Qt::Orientation::Vertical</enum>

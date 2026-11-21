@@ -81,6 +81,26 @@ void PerfStats::EndSystemFrame() {
 
     previous_frame_length = frame_end - previous_frame_end;
     previous_frame_end = frame_end;
+
+    recent_frames[recent_frame_count++ % RecentFrameCount] = {
+        frame_end, std::chrono::duration<double, std::milli>(previous_frame_length).count()};
+}
+
+std::vector<double> PerfStats::GetRecentFrameTimes(Clock::duration span) const {
+    std::scoped_lock lock{object_mutex};
+
+    const auto since = Clock::now() - span;
+    const std::size_t available = std::min(recent_frame_count, RecentFrameCount);
+    std::size_t first = recent_frame_count - available;
+    while (first < recent_frame_count && recent_frames[first % RecentFrameCount].first < since) {
+        ++first;
+    }
+    std::vector<double> out;
+    out.reserve(recent_frame_count - first);
+    for (std::size_t i = first; i < recent_frame_count; ++i) {
+        out.push_back(recent_frames[i % RecentFrameCount].second);
+    }
+    return out;
 }
 
 void PerfStats::EndGameFrame() {

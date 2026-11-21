@@ -56,6 +56,7 @@ add_executable(tests
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
     core/nup_writer.cpp
+    core/music_extract.cpp
     core/nup_zstd_read.cpp
     core/nx2_debug_server.cpp
     core/nx2_movie_pacing.cpp
@@ -126,7 +127,7 @@ if (ENABLE_UPDATE_CHECKER)
         ../frontend_common/update_installer.cpp)
 endif()
 
-target_link_libraries(tests PRIVATE common core input_common video_core)
+target_link_libraries(tests PRIVATE common core input_common video_core Opus::opus)
 
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)

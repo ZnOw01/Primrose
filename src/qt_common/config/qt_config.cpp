@@ -337,6 +337,15 @@ void QtConfig::ReadUIGamelistValues() {
     }
     EndArray();
 
+    UISettings::values.recent_home_backgrounds.clear();
+    const int backgrounds_size = BeginArray("recent_home_backgrounds");
+    for (int i = 0; i < backgrounds_size; ++i) {
+        SetArrayIndex(i);
+        UISettings::values.recent_home_backgrounds.append(
+            QString::fromStdString(ReadStringSetting("path")));
+    }
+    EndArray();
+
     EndGroup();
 }
 
@@ -571,6 +580,13 @@ void QtConfig::SaveUIGamelistValues() {
     }
 
     EndArray(); // ryujinx
+
+    BeginArray(std::string("recent_home_backgrounds"));
+    for (int j = 0; j < UISettings::values.recent_home_backgrounds.size(); ++j) {
+        SetArrayIndex(j);
+        WriteStringSetting("path", UISettings::values.recent_home_backgrounds[j].toStdString());
+    }
+    EndArray();
 
     EndGroup();
 }

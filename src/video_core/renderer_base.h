@@ -9,6 +9,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "common/common_funcs.h"
 #include "common/common_types.h"
@@ -50,6 +51,16 @@ public:
     [[nodiscard]] virtual RasterizerInterface* ReadRasterizer() = 0;
 
     [[nodiscard]] virtual std::string GetDeviceVendor() const = 0;
+
+    struct DeviceMemory {
+        u64 used;  ///< what this process uses
+        u64 total; ///< the size of the main device-local heap
+    };
+
+    /// Device memory use, when the backend can report it.
+    [[nodiscard]] virtual std::optional<DeviceMemory> GetDeviceMemory() const {
+        return std::nullopt;
+    }
 
     // Getter/setter functions:
     // ------------------------

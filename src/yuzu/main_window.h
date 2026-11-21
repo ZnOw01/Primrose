@@ -376,6 +376,7 @@ private slots:
     void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
     void OnGameListDeleteShaderWarm(u64 program_id);
     void OnGameListExtractNup(const std::string& game_path);
+    void OnGameListExtractMusic(const std::string& game_path);
     void OnGameListEditNupMetadata(const std::string& game_path);
     void OnGameListCopyTID(u64 program_id);
     void OnGameListCreateShortcut(u64 program_id, const std::string& game_path,
@@ -440,6 +441,7 @@ private slots:
     void SetTreeView();
     void SetCarouselView();
 
+    void SetGameIconSize(u32 size);
     void CheckIconSize();
     void ToggleShowGameName();
 

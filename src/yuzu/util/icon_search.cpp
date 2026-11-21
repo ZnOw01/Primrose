@@ -48,6 +48,7 @@ constexpr int IconTargetSize = 256;
 constexpr int MinCandidateScore = 300;
 constexpr std::size_t MaxIconDownloads = 3;
 constexpr std::size_t MaxSgdbChoices = 8;
+constexpr int HeroMaxWidth = 1280;
 
 std::vector<u8> EncodeSquareIcon(const QImage& source) {
     if (source.isNull()) {
@@ -68,6 +69,21 @@ std::vector<u8> EncodeSquareIcon(const QImage& source) {
     QBuffer buffer(&encoded);
     buffer.open(QIODevice::WriteOnly);
     img.save(&buffer, "PNG");
+    return std::vector<u8>(encoded.begin(), encoded.end());
+}
+
+std::vector<u8> EncodeHero(const QImage& source) {
+    if (source.isNull()) {
+        return {};
+    }
+    QImage img = source.convertToFormat(QImage::Format_RGB888);
+    if (img.width() > HeroMaxWidth) {
+        img = img.scaledToWidth(HeroMaxWidth, Qt::SmoothTransformation);
+    }
+    QByteArray encoded;
+    QBuffer buffer(&encoded);
+    buffer.open(QIODevice::WriteOnly);
+    img.save(&buffer, "JPEG", 90);
     return std::vector<u8>(encoded.begin(), encoded.end());
 }
 
@@ -301,8 +317,9 @@ std::string UrlEncodePathSegment(std::string value) {
     return encoded;
 }
 
-// Icon image URLs from a SteamGridDB response, best size first.
-std::vector<std::string> ParseSgdbIconUrls(const std::string& body) {
+// Image URLs from a SteamGridDB response, best first. Heroes use the thumbnail: the full images
+// are several megabytes and the sidebar shows them at most ~700 px wide.
+std::vector<std::string> ParseSgdbImageUrls(const std::string& body, bool prefer_thumb) {
     std::vector<std::string> urls;
     const auto json = nlohmann::json::parse(body, nullptr, false);
     if (json.is_discarded() || !json.is_object() || !json.contains("data") ||
@@ -313,7 +330,12 @@ std::vector<std::string> ParseSgdbIconUrls(const std::string& body) {
         if (urls.size() >= MaxSgdbChoices) {
             break;
         }
-        if (item.is_object() && item.contains("url") && item["url"].is_string()) {
+        if (!item.is_object()) {
+            continue;
+        }
+        if (prefer_thumb && item.contains("thumb") && item["thumb"].is_string()) {
+            urls.push_back(item["thumb"].get<std::string>());
+        } else if (item.contains("url") && item["url"].is_string()) {
             urls.push_back(item["url"].get<std::string>());
         }
     }
@@ -371,6 +393,104 @@ int ScoreCandidateTitle(const std::string& candidate, const std::string& query) 
 }
 
 
+IconSearchStatus ToSearchStatus(const HttpResult& res) {
+    switch (res.status) {
+    case HttpStatus::Timeout:
+        return IconSearchStatus::Timeout;
+    case HttpStatus::Cancelled:
+        return IconSearchStatus::Cancelled;
+    case HttpStatus::Unauthorized:
+        return IconSearchStatus::BadApiKey;
+    default:
+        return IconSearchStatus::NetworkError;
+    }
+}
+
+// Collects every SteamGridDB image of one kind that arrives before the deadline, for the user to
+// pick from. Sets out.status.
+void SearchSgdb(const std::string& search_name, const std::string& api_key, SgdbArtKind kind,
+                std::chrono::steady_clock::time_point deadline, const std::atomic_bool& cancel,
+                IconSearchResult& out) {
+    const auto sgdb_get = [&](const std::string& path) {
+        return HttpGet(std::string{SgdbApiBase} + path, deadline, cancel, api_key);
+    };
+    const auto search = sgdb_get("/search/autocomplete/" + UrlEncodePathSegment(search_name));
+    if (search.status != HttpStatus::Ok) {
+        out.status = ToSearchStatus(search);
+        out.error = search.detail;
+        return;
+    }
+    const auto parsed = nlohmann::json::parse(search.body, nullptr, false);
+    int game_id = 0;
+    if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("data") &&
+        parsed["data"].is_array() && !parsed["data"].empty() && parsed["data"][0].is_object() &&
+        parsed["data"][0].contains("id") && parsed["data"][0]["id"].is_number_integer()) {
+        game_id = parsed["data"][0]["id"].get<int>();
+    }
+    if (game_id <= 0) {
+        out.status = IconSearchStatus::NotFound;
+        return;
+    }
+    const bool hero = kind == SgdbArtKind::Hero;
+    const auto list =
+        sgdb_get(hero ? fmt::format("/heroes/game/{}?mimes=image/png,image/jpeg", game_id)
+                      : fmt::format("/icons/game/{}?dimensions=256,512&mimes=image/png", game_id));
+    if (list.status != HttpStatus::Ok) {
+        out.status = ToSearchStatus(list);
+        out.error = list.detail;
+        return;
+    }
+    for (const auto& url : ParseSgdbImageUrls(list.body, hero)) {
+        const auto img = HttpGet(url, deadline, cancel);
+        if (img.status != HttpStatus::Ok) {
+            if (img.status == HttpStatus::Cancelled || img.status == HttpStatus::Timeout) {
+                if (out.choices.empty()) {
+                    out.status = ToSearchStatus(img);
+                    out.error = img.detail;
+                    return;
+                }
+                break;
+            }
+            continue;
+        }
+        QImage decoded;
+        if (!decoded.loadFromData(reinterpret_cast<const uchar*>(img.body.data()),
+                                  static_cast<int>(img.body.size()))) {
+            continue;
+        }
+        auto encoded = hero ? EncodeHero(decoded) : EncodeSquareIcon(decoded);
+        if (!encoded.empty()) {
+            out.choices.push_back(std::move(encoded));
+        }
+    }
+    out.status = out.choices.empty() ? IconSearchStatus::NotFound : IconSearchStatus::Choices;
+}
+
+IconSearchResult RunSgdbSearch(const std::string& raw_query, u64 tid, const std::string& api_key,
+                               SgdbArtKind kind, const std::atomic_bool& cancel) {
+    IconSearchResult out;
+    try {
+        if (api_key.empty()) {
+            out.status = IconSearchStatus::NeedsApiKey;
+            return out;
+        }
+        const std::string search_name = ResolveGameNameAlias(raw_query, tid);
+        if (search_name.empty()) {
+            out.status = IconSearchStatus::NotFound;
+            return out;
+        }
+        SearchSgdb(search_name, api_key, kind, std::chrono::steady_clock::now() + SearchDeadline,
+                   cancel, out);
+    } catch (const std::exception& e) {
+        out.status = IconSearchStatus::InternalError;
+        out.error = e.what();
+    } catch (...) {
+        out.status = IconSearchStatus::InternalError;
+        out.error = "unknown error";
+    }
+    return out;
+}
+
 IconSearchResult RunIconSearch(const std::string& raw_query, u64 tid, const std::string& api_key,
                                const std::atomic_bool& cancel) {
     using namespace std::chrono;
@@ -387,18 +507,7 @@ IconSearchResult RunIconSearch(const std::string& raw_query, u64 tid, const std:
             return out;
         }
 
-        const auto to_status = [](const HttpResult& res) {
-            switch (res.status) {
-            case HttpStatus::Timeout:
-                return IconSearchStatus::Timeout;
-            case HttpStatus::Cancelled:
-                return IconSearchStatus::Cancelled;
-            case HttpStatus::Unauthorized:
-                return IconSearchStatus::BadApiKey;
-            default:
-                return IconSearchStatus::NetworkError;
-            }
-        };
+        const auto to_status = ToSearchStatus;
         const auto decode_icon = [&out](const std::string& body) {
             QImage img;
             if (img.loadFromData(reinterpret_cast<const uchar*>(body.data()),
@@ -475,58 +584,7 @@ IconSearchResult RunIconSearch(const std::string& raw_query, u64 tid, const std:
             out.error = primary_error;
             return out;
         }
-        const auto sgdb_get = [&](const std::string& path) {
-            return HttpGet(std::string{SgdbApiBase} + path, deadline, cancel, api_key);
-        };
-        const auto search = sgdb_get("/search/autocomplete/" + UrlEncodePathSegment(search_name));
-        if (search.status != HttpStatus::Ok) {
-            out.status = to_status(search);
-            out.error = search.detail;
-            return out;
-        }
-        const auto parsed = nlohmann::json::parse(search.body, nullptr, false);
-        int game_id = 0;
-        if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("data") &&
-            parsed["data"].is_array() && !parsed["data"].empty() &&
-            parsed["data"][0].is_object() && parsed["data"][0].contains("id") &&
-            parsed["data"][0]["id"].is_number_integer()) {
-            game_id = parsed["data"][0]["id"].get<int>();
-        }
-        if (game_id <= 0) {
-            out.status = IconSearchStatus::NotFound;
-            return out;
-        }
-        const auto icons =
-            sgdb_get(fmt::format("/icons/game/{}?dimensions=256,512&mimes=image/png", game_id));
-        if (icons.status != HttpStatus::Ok) {
-            out.status = to_status(icons);
-            out.error = icons.detail;
-            return out;
-        }
-        // Collect every icon that arrives in time; the user picks one.
-        for (const auto& url : ParseSgdbIconUrls(icons.body)) {
-            const auto img = HttpGet(url, deadline, cancel);
-            if (img.status != HttpStatus::Ok) {
-                if (img.status == HttpStatus::Cancelled || img.status == HttpStatus::Timeout) {
-                    if (out.choices.empty()) {
-                        out.status = to_status(img);
-                        out.error = img.detail;
-                        return out;
-                    }
-                    break;
-                }
-                continue;
-            }
-            if (decode_icon(img.body)) {
-                out.choices.push_back(std::move(out.icon_bytes));
-                out.icon_bytes.clear();
-            }
-        }
-        if (!out.choices.empty()) {
-            out.status = IconSearchStatus::Choices;
-            return out;
-        }
-        out.status = IconSearchStatus::NotFound;
+        SearchSgdb(search_name, api_key, SgdbArtKind::Icon, deadline, cancel, out);
     } catch (const std::exception& e) {
         out.status = IconSearchStatus::InternalError;
         out.error = e.what();
@@ -549,6 +607,14 @@ IconSearch::~IconSearch() {
 }
 
 void IconSearch::Start(const QString& name, u64 title_id) {
+    Run(name, title_id, std::nullopt);
+}
+
+void IconSearch::StartSteamGridDb(const QString& name, u64 title_id, SgdbArtKind kind) {
+    Run(name, title_id, kind);
+}
+
+void IconSearch::Run(const QString& name, u64 title_id, std::optional<SgdbArtKind> kind) {
     if (watcher.isRunning()) {
         return;
     }
@@ -560,12 +626,16 @@ void IconSearch::Start(const QString& name, u64 title_id) {
     }
     last_name = name;
     last_title_id = title_id;
+    sgdb_kind = kind;
     cancel_flag->store(false);
     emit RunningChanged(true);
     // The worker captures no pointer to the dialog, so it may safely outlive it.
     watcher.setFuture(QtConcurrent::run(
-        [query, title_id, api_key = UISettings::values.steamgriddb_api_key.GetValue(),
-         cancel = cancel_flag] { return RunIconSearch(query, title_id, api_key, *cancel); }));
+        [query, title_id, kind, api_key = UISettings::values.steamgriddb_api_key.GetValue(),
+         cancel = cancel_flag] {
+            return kind ? RunSgdbSearch(query, title_id, api_key, *kind, *cancel)
+                        : RunIconSearch(query, title_id, api_key, *cancel);
+        }));
 }
 
 bool IconSearch::IsRunning() const {
@@ -573,17 +643,20 @@ bool IconSearch::IsRunning() const {
 }
 
 int IconSearch::ChooseIcon(const std::vector<std::vector<u8>>& choices) {
-    if (choices.size() == 1) {
+    const bool hero = sgdb_kind == SgdbArtKind::Hero;
+    if (choices.size() == 1 && !sgdb_kind) {
         return 0;
     }
     QDialog dialog(parent_widget);
-    dialog.setWindowTitle(tr("Choose an Icon"));
+    dialog.setWindowTitle(hero ? tr("Choose a Banner") : tr("Choose an Icon"));
     auto* layout = new QVBoxLayout(&dialog);
-    layout->addWidget(
-        new QLabel(tr("SteamGridDB has several icons for this game. Pick one:"), &dialog));
+    layout->addWidget(new QLabel(hero
+                                     ? tr("SteamGridDB banners for this game. Pick one:")
+                                     : tr("SteamGridDB has several icons for this game. Pick one:"),
+                                 &dialog));
     auto* list = new QListWidget(&dialog);
     list->setViewMode(QListView::IconMode);
-    list->setIconSize(QSize(128, 128));
+    list->setIconSize(hero ? QSize(310, 100) : QSize(128, 128));
     list->setResizeMode(QListView::Adjust);
     list->setMovement(QListView::Static);
     list->setSpacing(8);
@@ -591,7 +664,7 @@ int IconSearch::ChooseIcon(const std::vector<std::vector<u8>>& choices) {
     for (std::size_t i = 0; i < choices.size(); ++i) {
         QPixmap map;
         if (map.loadFromData(choices[i].data(), static_cast<uint>(choices[i].size()))) {
-            auto* item = new QListWidgetItem(QIcon(map), QString::number(i + 1));
+            auto* item = new QListWidgetItem(QIcon(map), hero ? QString{} : QString::number(i + 1));
             item->setData(Qt::UserRole, static_cast<int>(i));
             list->addItem(item);
         }
@@ -606,7 +679,7 @@ int IconSearch::ChooseIcon(const std::vector<std::vector<u8>>& choices) {
     connect(list, &QListWidget::itemDoubleClicked, &dialog, &QDialog::accept);
     layout->addWidget(list);
     layout->addWidget(buttons);
-    dialog.resize(520, 420);
+    dialog.resize(hero ? 720 : 520, 420);
     if (dialog.exec() != QDialog::Accepted || list->currentItem() == nullptr) {
         return -1;
     }
@@ -614,14 +687,22 @@ int IconSearch::ChooseIcon(const std::vector<std::vector<u8>>& choices) {
 }
 
 bool IconSearch::AskForApiKey(bool missing) {
-    QString text = missing ? tr("No matching icon was found on switchiconshowdown.com. A "
-                                "SteamGridDB API key enables a fallback search.")
-                           : tr("SteamGridDB rejected the saved API key.");
+    QString text;
+    if (!missing) {
+        text = tr("SteamGridDB rejected the saved API key.");
+    } else if (sgdb_kind) {
+        text = tr("Finding banners and icons on SteamGridDB needs a free API key.");
+    } else {
+        text = tr("No matching icon was found on switchiconshowdown.com. A SteamGridDB API key "
+                  "enables a fallback search.");
+    }
     if (UISettings::values.steamgriddb_api_key.GetValue().empty()) {
         text += QStringLiteral("<br><br>") +
                 tr("Create a free key on the <a href=\"%1\">SteamGridDB API preferences</a> page.")
                     .arg(QStringLiteral("https://www.steamgriddb.com/profile/preferences/api"));
     }
+    text += QStringLiteral("<br><br>") +
+            tr("You can also set or change it later in Settings > General > Web.");
     QDialog dialog(parent_widget);
     dialog.setWindowTitle(tr("SteamGridDB API Key"));
     auto* layout = new QVBoxLayout(&dialog);
@@ -660,10 +741,14 @@ void IconSearch::OnFinished() {
         result.status = IconSearchStatus::InternalError;
     }
 
-    const auto select = [&](std::vector<u8> png) {
-        emit IconSelected(QByteArray(reinterpret_cast<const char*>(png.data()),
-                                     static_cast<qsizetype>(png.size())),
-                          QString::fromStdString(result.resolved_title));
+    const auto select = [&](std::vector<u8> bytes) {
+        const QByteArray data(reinterpret_cast<const char*>(bytes.data()),
+                              static_cast<qsizetype>(bytes.size()));
+        if (sgdb_kind == SgdbArtKind::Hero) {
+            emit HeroSelected(data);
+        } else {
+            emit IconSelected(data, QString::fromStdString(result.resolved_title));
+        }
     };
 
     QString message;
@@ -679,13 +764,19 @@ void IconSearch::OnFinished() {
         return;
     }
     case IconSearchStatus::NotFound:
-        message = tr("No matching icon was found on switchiconshowdown.com or SteamGridDB. Try a "
-                     "different game name or choose an icon file.");
+        if (sgdb_kind == SgdbArtKind::Hero) {
+            message = tr("SteamGridDB has no banners for this game.");
+        } else if (sgdb_kind) {
+            message = tr("SteamGridDB has no icons for this game.");
+        } else {
+            message = tr("No matching icon was found on switchiconshowdown.com or SteamGridDB. "
+                         "Try a different game name or choose an icon file.");
+        }
         break;
     case IconSearchStatus::NeedsApiKey:
     case IconSearchStatus::BadApiKey:
         if (AskForApiKey(result.status == IconSearchStatus::NeedsApiKey)) {
-            Start(last_name, last_title_id);
+            Run(last_name, last_title_id, sgdb_kind);
         }
         return;
     case IconSearchStatus::Timeout:
@@ -705,5 +796,7 @@ void IconSearch::OnFinished() {
         break;
     }
     LOG_WARNING(Frontend, "Icon search failed: {}", message.toStdString());
-    QMessageBox::warning(parent_widget, tr("Find Icon"), message);
+    QMessageBox::warning(parent_widget,
+                         sgdb_kind == SgdbArtKind::Hero ? tr("Find Banner") : tr("Find Icon"),
+                         message);
 }

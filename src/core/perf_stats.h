@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstddef>
 #include <mutex>
+#include <utility>
+#include <vector>
 #include "common/common_types.h"
 
 namespace Core {
@@ -51,6 +53,12 @@ public:
      */
     double GetLastFrameTimeScale() const;
 
+    /// Visible frame intervals (end to end, in ms) of the frames that ended within `span` of now,
+    /// oldest first. Covers at most the last RecentFrameCount frames.
+    std::vector<double> GetRecentFrameTimes(Clock::duration span) const;
+
+    static constexpr std::size_t RecentFrameCount = 4096;
+
 private:
     mutable std::mutex object_mutex;
 
@@ -82,6 +90,10 @@ private:
     Clock::duration previous_frame_length = Clock::duration::zero();
     /// Previously computed fps
     double previous_fps = 0;
+
+    /// Ring of the latest frame intervals and their end times, for the performance overlay
+    std::array<std::pair<Clock::time_point, double>, RecentFrameCount> recent_frames{};
+    std::size_t recent_frame_count = 0;
 };
 
 class SpeedLimiter {

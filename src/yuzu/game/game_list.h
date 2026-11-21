@@ -12,6 +12,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QList>
+#include <QPersistentModelIndex>
 #include <QPushButton>
 #include <QStandardItemModel>
 #include <QString>
@@ -41,6 +42,16 @@ enum class AmLaunchType;
 enum class StartGameType;
 
 class GameCarousel;
+class GameDetailsPanel;
+class HomeBackground;
+class HomeCustomizePanel;
+class HomeSurface;
+class FloatingActionButton;
+class QHBoxLayout;
+class QPropertyAnimation;
+class QThreadPool;
+class QTimer;
+struct GameDetailsInfo;
 
 class QAbstractItemView;
 namespace Core {
@@ -91,6 +102,13 @@ public:
 
     void ResetViewMode();
 
+    void ShowCustomizePanel(bool show);
+    void ShowGameDetails(const QModelIndex& index);
+    void HideGameDetails();
+    /// Selects the game with this path and opens its sidebar, now and again after the next
+    /// repopulate (which replaces every row).
+    void ShowGameDetailsForPath(const QString& path);
+
 public slots:
     void SetNupConversionRunning(bool running);
     void RefreshGameDirectory();
@@ -115,6 +133,7 @@ signals:
     void VerifyIntegrityRequested(const std::string& game_path);
     void ConvertToNupRequested(const std::string& game_path);
     void ExtractNupRequested(const std::string& game_path);
+    void ExtractMusicRequested(const std::string& game_path);
     void EditNupMetadataRequested(const std::string& game_path);
     void CopyTIDRequested(u64 program_id);
     void CreateShortcut(u64 program_id, const std::string& game_path,
@@ -127,6 +146,8 @@ signals:
     void ShowList(bool show);
     void PopulatingCompleted();
     void SaveConfig();
+    void GameListModeRequested(Settings::GameListMode mode);
+    void GameIconSizeRequested(u32 size);
 
 private slots:
     void OnTextChanged(const QString& new_text);
@@ -138,6 +159,7 @@ private:
     void SetupScrollAnimation();
     bool eventFilter(QObject* obj, QEvent* event) override;
     void changeEvent(QEvent*) override;
+    void resizeEvent(QResizeEvent* event) override;
 
     void ValidateEntry(const QModelIndex& item);
 
@@ -151,13 +173,44 @@ private:
 
     void RetranslateUI();
 
+    void SetupCustomization();
+    void SetupGameDetails();
+    QPropertyAnimation* MakeSlideAnimation(QWidget* panel);
+    void SlidePanel(QWidget* panel, QPropertyAnimation* animation, int width);
+    void OnItemClicked(const QModelIndex& index);
+    void UpdateGameIcon(u64 program_id);
+    QModelIndex FindGame(const QString& path) const;
+    bool RevealPendingGame();
+    void SetHomeBackground(const QString& path);
+    void RemoveRecentBackground(const QString& path);
+    void UpdateViewTransparency();
+    void PlaceCustomizeButton();
+    void LoadGameDetailsExtras();
+    /// Docks the sidebars beside the games, or lays them over the games on narrow windows.
+    void UpdatePanelPlacement();
+    void RefreshCustomizeButtonIcon();
+
     friend class GameListSearchField;
 
     std::shared_ptr<FileSys::VfsFilesystem> vfs;
     FileSys::ManualContentProvider* provider;
     GameListSearchField* search_field = nullptr;
     MainWindow* main_window = nullptr;
+    QHBoxLayout* outer_layout = nullptr;
+    HomeSurface* surface = nullptr;
     QVBoxLayout* layout = nullptr;
+    HomeBackground* background = nullptr;
+    HomeCustomizePanel* customize_panel = nullptr;
+    QPropertyAnimation* customize_animation = nullptr;
+    FloatingActionButton* customize_button = nullptr;
+    GameDetailsPanel* details_panel = nullptr;
+    QPropertyAnimation* details_animation = nullptr;
+    QPersistentModelIndex details_index;
+    QTimer* details_timer = nullptr;
+    QThreadPool* details_pool = nullptr;
+    bool add_ons_changed = false;
+    bool panels_overlay = false;
+    QString pending_details_path;
 
     GameTree* tree_view = nullptr;
     GameGrid* grid_view = nullptr;

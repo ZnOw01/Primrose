@@ -77,6 +77,8 @@ void ConfigureWeb::SetConfiguration() {
     VerifyLogin();
 
     ui->toggle_discordrpc->setChecked(UISettings::values.enable_discord_presence.GetValue());
+    ui->edit_steamgriddb_key->setText(
+        QString::fromStdString(UISettings::values.steamgriddb_api_key.GetValue()));
 }
 
 void ConfigureWeb::GenerateToken() {
@@ -96,6 +98,8 @@ void ConfigureWeb::ApplyConfiguration() {
     UISettings::values.enable_discord_presence = ui->toggle_discordrpc->isChecked();
     Settings::values.eden_username = ui->edit_username->text().toStdString();
     Settings::values.eden_token = ui->edit_token->text().toStdString();
+    UISettings::values.steamgriddb_api_key =
+        ui->edit_steamgriddb_key->text().trimmed().toStdString();
 }
 
 void ConfigureWeb::VerifyLogin() {

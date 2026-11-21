@@ -27,6 +27,7 @@ add_library(qt_common STATIC
     util/fs.h util/fs.cpp
     util/mod.h util/mod.cpp
     util/vk.h util/vk.cpp
+    util/game_art.h util/game_art.cpp
 
     abstract/frontend.h abstract/frontend.cpp
     abstract/progress.h abstract/progress.cpp

@@ -119,9 +119,10 @@ public:
 
         LOG_INFO(Service_Audio,
                  "Opening SDL stream {} with: rate {} channels {} (system channels {}) "
-                 " format {}",
+                 " format {} device \"{}\"",
                  static_cast<const void*>(stream), stream_out.freq, stream_out.channels,
-                 system_channels, static_cast<int>(stream_out.format));
+                 system_channels, static_cast<int>(stream_out.format),
+                 SDL_GetAudioDeviceName(audio_device) ? SDL_GetAudioDeviceName(audio_device) : "");
     }
 
     /**
@@ -230,10 +231,14 @@ private:
 
 SDLSink::SDLSink(std::string_view target_device_name) {
     if (InitializeAudio()) {
+        // One sink is created per direction (output and input), each with that direction's device
+        // name, so the name selects whichever stream asks for it.
         if (target_device_name != auto_device_name && !target_device_name.empty()) {
             output_device = target_device_name;
+            input_device = target_device_name;
         } else {
             output_device.clear();
+            input_device.clear();
         }
         device_channels = 2;
     }

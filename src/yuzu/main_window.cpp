@@ -42,12 +42,13 @@
 
 #include "bootmanager.h"
 #include "loading_screen.h"
-#include "recommended_settings_dialog.h"
 #include "qt_common/util/vk.h"
+#include "recommended_settings_dialog.h"
 #include "ryujinx_dialog.h"
 #include "set_play_time_dialog.h"
 #include "util/util.h"
 #include "yuzu/game/game_list.h"
+#include "yuzu/music_extract_dialog.h"
 #include "yuzu/nup_dialogs.h"
 #include "yuzu/shader_warm_dialog.h"
 #ifdef YUZU_ENABLE_MCP
@@ -625,13 +626,13 @@ void MainWindow::StartMcpServer() {
 
     if (!mcp_host) {
         mcp_host = std::make_unique<QtMcpHost>(*this);
-        connect(this, &MainWindow::statsUpdated, this,
-                [this](const Core::PerfStatsResults& results,
-                       const VideoCore::ShaderNotify& shaders) {
-                    if (mcp_host) {
-                        mcp_host->OnStatsUpdated(results, shaders);
-                    }
-                });
+        connect(
+            this, &MainWindow::statsUpdated, this,
+            [this](const Core::PerfStatsResults& results, const VideoCore::ShaderNotify& shaders) {
+                if (mcp_host) {
+                    mcp_host->OnStatsUpdated(results, shaders);
+                }
+            });
     }
     mcp_server = std::make_unique<Mcp::Server>(*QtCommon::system, *mcp_host, mcp_config);
     if (const std::string error = mcp_server->Start(); !error.empty()) {
@@ -746,11 +747,10 @@ void MainWindow::SetupMcpMenu() {
     });
     connect(mcp_menu->addAction(tr("Copy Connection URL")), &QAction::triggered, this,
             [url] { QGuiApplication::clipboard()->setText(url()); });
-    connect(mcp_menu->addAction(tr("Copy Claude Code Command")), &QAction::triggered, this,
-            [url] {
-                QGuiApplication::clipboard()->setText(
-                    QStringLiteral("claude mcp add --transport http eglantine %1").arg(url()));
-            });
+    connect(mcp_menu->addAction(tr("Copy Claude Code Command")), &QAction::triggered, this, [url] {
+        QGuiApplication::clipboard()->setText(
+            QStringLiteral("claude mcp add --transport http eglantine %1").arg(url()));
+    });
 }
 
 /// Syncs the MCP menu checkboxes and status text with the server state.
@@ -767,8 +767,7 @@ void MainWindow::UpdateMcpMenu() {
         mcp_status_action->setText(
             tr("Listening on %1").arg(QString::fromStdString(mcp_server->Url())));
     } else if (!mcp_last_error.empty()) {
-        mcp_status_action->setText(
-            tr("Failed: %1").arg(QString::fromStdString(mcp_last_error)));
+        mcp_status_action->setText(tr("Failed: %1").arg(QString::fromStdString(mcp_last_error)));
     } else {
         mcp_status_action->setText(tr("Stopped"));
     }
@@ -783,15 +782,15 @@ void MainWindow::PopulateMcpRoutesMenu() {
         mcp_routes_menu->addAction(text)->setEnabled(false);
     };
     const auto open_folder = [this] {
-        connect(mcp_routes_menu->addAction(tr("Open Routes Folder")), &QAction::triggered, this,
-                [] {
-                    const auto dir =
-                        Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "mcp" / "routes";
-                    std::error_code ec;
-                    std::filesystem::create_directories(dir, ec);
-                    QDesktopServices::openUrl(QUrl::fromLocalFile(
-                        QString::fromStdString(Common::FS::PathToUTF8String(dir))));
-                });
+        connect(
+            mcp_routes_menu->addAction(tr("Open Routes Folder")), &QAction::triggered, this, [] {
+                const auto dir =
+                    Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "mcp" / "routes";
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                QDesktopServices::openUrl(
+                    QUrl::fromLocalFile(QString::fromStdString(Common::FS::PathToUTF8String(dir))));
+            });
     };
     if (!mcp_server) {
         disabled(tr("The MCP server is off"));
@@ -843,12 +842,13 @@ void MainWindow::PopulateMcpRoutesMenu() {
         connect(mcp_routes_menu->addAction(tr("Record New Route...")), &QAction::triggered, this,
                 [this, show_error, call] {
                     bool ok = false;
-                    const QString name = QInputDialog::getText(
-                        this, tr("Record Route"),
-                        tr("Route name (e.g. to_gameplay). Pause briefly on each screen before "
-                           "pressing; stop from this menu when done:"),
-                        QLineEdit::Normal, QStringLiteral("to_gameplay"), &ok)
-                                             .trimmed();
+                    const QString name =
+                        QInputDialog::getText(
+                            this, tr("Record Route"),
+                            tr("Route name (e.g. to_gameplay). Pause briefly on each screen before "
+                               "pressing; stop from this menu when done:"),
+                            QLineEdit::Normal, QStringLiteral("to_gameplay"), &ok)
+                            .trimmed();
                     if (!ok || name.isEmpty()) {
                         return;
                     }
@@ -862,16 +862,15 @@ void MainWindow::PopulateMcpRoutesMenu() {
                 });
     }
     if (activity.route_state == "running") {
-        connect(mcp_routes_menu->addAction(tr("Stop Route \"%1\"")
-                                               .arg(QString::fromStdString(activity.route))),
-                &QAction::triggered, this,
-                [call] { call("route_stop", Mcp::json::object()); });
+        connect(mcp_routes_menu->addAction(
+                    tr("Stop Route \"%1\"").arg(QString::fromStdString(activity.route))),
+                &QAction::triggered, this, [call] { call("route_stop", Mcp::json::object()); });
     }
 
     mcp_routes_menu->addSeparator();
     const auto list = mcp_server->CallTool("route_list", {{"summary", true}});
-    const auto routes = list.structured ? list.structured->value("routes", Mcp::json::array())
-                                        : Mcp::json::array();
+    const auto routes =
+        list.structured ? list.structured->value("routes", Mcp::json::array()) : Mcp::json::array();
     if (routes.empty()) {
         disabled(tr("No routes for this game yet"));
     }
@@ -889,12 +888,12 @@ void MainWindow::PopulateMcpRoutesMenu() {
         });
         connect(sub->addAction(tr("Delete...")), &QAction::triggered, this,
                 [this, name, qname, call] {
-            if (QMessageBox::question(this, tr("Delete Route"),
-                                      tr("Delete the route \"%1\"?").arg(qname)) ==
-                QMessageBox::Yes) {
-                call("route_list", {{"remove", name}, {"summary", true}});
-            }
-        });
+                    if (QMessageBox::question(this, tr("Delete Route"),
+                                              tr("Delete the route \"%1\"?").arg(qname)) ==
+                        QMessageBox::Yes) {
+                        call("route_list", {{"remove", name}, {"summary", true}});
+                    }
+                });
     }
     mcp_routes_menu->addSeparator();
     open_folder();
@@ -916,12 +915,10 @@ void MainWindow::UpdateMcpStatusLabel() {
     mcp_status_label->setVisible(true);
     const auto s = mcp_server->GetSummary();
     const auto& a = s.activity;
-    const auto idle_s =
-        a.tool_calls == 0
-            ? -1
-            : std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
-                                                               a.last_tool_time)
-                  .count();
+    const auto idle_s = a.tool_calls == 0 ? -1
+                                          : std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::steady_clock::now() - a.last_tool_time)
+                                                .count();
     const bool active = idle_s >= 0 && idle_s < 10;
 
     QStringList parts;
@@ -963,7 +960,8 @@ void MainWindow::UpdateMcpStatusLabel() {
                       .arg(s.controller.empty() ? tr("free") : QString::fromStdString(s.controller))
                       .arg(a.tool_calls);
     if (idle_s >= 0) {
-        tip += tr("\nLast call: %1 (%2 s ago)").arg(QString::fromStdString(a.last_tool)).arg(idle_s);
+        tip +=
+            tr("\nLast call: %1 (%2 s ago)").arg(QString::fromStdString(a.last_tool)).arg(idle_s);
     }
     if (!a.route_detail.empty()) {
         tip += QStringLiteral("\n") + QString::fromStdString(a.route_detail);
@@ -1904,6 +1902,7 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::DeleteShaderWarmRequested, this,
             &MainWindow::OnGameListDeleteShaderWarm);
     connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
+    connect(game_list, &GameList::ExtractMusicRequested, this, &MainWindow::OnGameListExtractMusic);
     connect(game_list, &GameList::EditNupMetadataRequested, this,
             &MainWindow::OnGameListEditNupMetadata);
     connect(game_list, &GameList::CopyTIDRequested, this, &MainWindow::OnGameListCopyTID);
@@ -1915,6 +1914,8 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::PopulatingCompleted,
             [this] { multiplayer_state->UpdateGameList(game_list->GetModel()); });
     connect(game_list, &GameList::SaveConfig, this, &MainWindow::OnSaveConfig);
+    connect(game_list, &GameList::GameListModeRequested, this, &MainWindow::SetGameListMode);
+    connect(game_list, &GameList::GameIconSizeRequested, this, &MainWindow::SetGameIconSize);
 
     connect(game_list, &GameList::OpenPerGameGeneralRequested, this,
             &MainWindow::OnGameListOpenPerGameProperties);
@@ -2004,11 +2005,7 @@ void MainWindow::ConnectMenuEvents() {
 
         connect(action, &QAction::triggered, this, [this, size](bool checked) {
             if (checked) {
-                UISettings::values.game_icon_size.SetValue(size);
-                CheckIconSize();
-
-                game_list->UpdateIconSizes();
-                game_list->RefreshGameDirectory();
+                SetGameIconSize(size);
             }
         });
     }
@@ -2097,8 +2094,8 @@ void MainWindow::ConnectMenuEvents() {
     const auto previous_version = [] {
         const std::filesystem::path target{qEnvironmentVariable("APPIMAGE").toStdString()};
         std::error_code ec;
-        return !target.empty() && std::filesystem::is_regular_file(
-                                      UpdateInstaller::PreviousPath(target), ec)
+        return !target.empty() &&
+                       std::filesystem::is_regular_file(UpdateInstaller::PreviousPath(target), ec)
                    ? target
                    : std::filesystem::path{};
     };
@@ -2108,16 +2105,15 @@ void MainWindow::ConnectMenuEvents() {
             std::filesystem::path{QCoreApplication::applicationDirPath().toStdWString()} /
             UpdateInstaller::BackupName;
         std::error_code ec;
-        const bool has_files =
-            std::filesystem::is_directory(backup, ec) &&
-            std::filesystem::directory_iterator{backup, ec} != std::filesystem::directory_iterator{};
+        const bool has_files = std::filesystem::is_directory(backup, ec) &&
+                               std::filesystem::directory_iterator{backup, ec} !=
+                                   std::filesystem::directory_iterator{};
         return has_files ? backup : std::filesystem::path{};
     };
 #endif
-    connect(ui->menu_Help, &QMenu::aboutToShow, restore_action,
-            [restore_action, previous_version] {
-                restore_action->setVisible(!previous_version().empty());
-            });
+    connect(ui->menu_Help, &QMenu::aboutToShow, restore_action, [restore_action, previous_version] {
+        restore_action->setVisible(!previous_version().empty());
+    });
     connect(restore_action, &QAction::triggered, this, [this, previous_version] {
         const auto previous = previous_version();
         if (previous.empty()) {
@@ -2858,6 +2854,7 @@ void MainWindow::OnEmulationStopped() {
         firmware_label->setVisible(true);
     }
 
+    const QString stopped_game_path = current_game_path;
     current_game_path.clear();
 
     // When closing the game, destroy the GLWindow to clear the context after the game is closed
@@ -2875,6 +2872,9 @@ void MainWindow::OnEmulationStopped() {
     } else if (!boot_in_progress) {
         game_list->SetScanEnabled(true);
         game_list->PopulateAsync(UISettings::values.game_dirs);
+        if (!stopped_game_path.isEmpty()) {
+            game_list->ShowGameDetailsForPath(stopped_game_path);
+        }
     }
 }
 
@@ -3760,7 +3760,7 @@ bool MainWindow::ConfirmShutdownGame() {
 void MainWindow::OnLoadComplete() {
     loading_screen->OnLoadComplete();
 
-    perf_overlay = new PerformanceOverlay(this);
+    perf_overlay = new PerformanceOverlay(this, render_window);
     perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
 
     connect(perf_overlay, &PerformanceOverlay::closed, perf_overlay,
@@ -4062,6 +4062,18 @@ void MainWindow::SetTreeView() {
 
 void MainWindow::SetCarouselView() {
     SetGameListMode(Settings::GameListMode::CarouselView);
+}
+
+void MainWindow::SetGameIconSize(u32 size) {
+    UISettings::values.game_icon_size.SetValue(size);
+    const auto actions = game_size_actions->actions();
+    for (size_t i = 0; i < default_game_icon_sizes.size(); i++) {
+        actions.at(i)->setChecked(default_game_icon_sizes[i].first == size);
+    }
+    CheckIconSize();
+
+    game_list->UpdateIconSizes();
+    game_list->RefreshGameDirectory();
 }
 
 void MainWindow::CheckIconSize() {
@@ -4831,9 +4843,9 @@ void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
     }
     std::string error;
     if (!DeleteShaderWarmFiles(program_id, error)) {
-        QMessageBox::critical(this, tr("Delete Pre-compiled Shaders"),
-                              tr("The files could not be deleted: %1")
-                                  .arg(QString::fromStdString(error)));
+        QMessageBox::critical(
+            this, tr("Delete Pre-compiled Shaders"),
+            tr("The files could not be deleted: %1").arg(QString::fromStdString(error)));
     }
 }
 
@@ -4928,6 +4940,122 @@ void MainWindow::OnGameListExtractNup(const std::string& game_path) {
                     break;
                 case FileSys::Nup::ExtractResult::InvalidSource:
                 case FileSys::Nup::ExtractResult::IoError:
+                    QMessageBox::critical(this, tr("Extraction Failed"),
+                                          QString::fromStdString(error));
+                    break;
+                }
+            },
+            Qt::QueuedConnection);
+        return FileSys::Nup::PackResult::Success;
+    }));
+}
+
+void MainWindow::OnGameListExtractMusic(const std::string& game_path) {
+    if (nup_running) {
+        return;
+    }
+    FileSys::Music::SourceInfo info;
+    if (!FileSys::Music::ScanMusic(game_path, info)) {
+        QMessageBox::warning(this, tr("Audio Explorer"),
+                             tr("No music could be found in this game. Only NUP archives and "
+                                "loose folder dumps are supported."));
+        return;
+    }
+    if (info.stream_count == 0) {
+        QMessageBox::information(this, tr("Audio Explorer"),
+                                 tr("No music streams were found in this game."));
+        return;
+    }
+
+    MusicExtractDialog dialog(info, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    FileSys::Music::Options options;
+    options.out_dir = dialog.OutDir();
+    options.layout = dialog.Layout();
+    options.encoding = dialog.Encoding();
+    options.kinds = dialog.Kinds();
+    options.cover_override = dialog.CoverOverride();
+    if (options.out_dir.empty()) {
+        return;
+    }
+
+    const QString progress_title = QString::fromStdString(info.game_title).trimmed().isEmpty()
+                                       ? tr("Extracting Music")
+                                       : QString::fromStdString(info.game_title);
+    nup_running = true;
+    nup_source_path = game_path;
+    game_list->SetNupConversionRunning(true);
+    nup_cancel = std::make_shared<std::atomic_bool>(false);
+    nup_progress = new NupProgressDialog(tr("Extracting Music"), progress_title, {}, this);
+    connect(nup_progress, &NupProgressDialog::CancelRequested, this, [this, cancel = nup_cancel] {
+        cancel->store(true);
+        if (nup_progress) {
+            nup_progress->SetCancelling();
+        }
+    });
+    nup_progress->show();
+
+    const auto cancel = nup_cancel;
+    auto last_update = std::make_shared<std::chrono::steady_clock::time_point>();
+    nup_watcher.setFuture(QtConcurrent::run([this, game_path, options, cancel, last_update] {
+        std::string error;
+        FileSys::Music::Summary summary;
+        const auto on_progress = [this, last_update](const FileSys::Music::Progress& progress) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - *last_update < std::chrono::milliseconds(200)) {
+                return;
+            }
+            *last_update = now;
+            QMetaObject::invokeMethod(
+                this,
+                [this, progress] {
+                    if (!nup_progress) {
+                        return;
+                    }
+                    nup_progress->SetProgress(
+                        FileSys::Nup::PackProgress{progress.bytes_done, progress.bytes_total,
+                                                   progress.files_done, progress.files_total});
+                },
+                Qt::QueuedConnection);
+        };
+        const auto result = FileSys::Music::ExtractMusic(game_path, options, on_progress,
+                                                         cancel.get(), &summary, &error);
+        QMetaObject::invokeMethod(
+            this,
+            [this, result, summary, error, out_dir = options.out_dir] {
+                nup_running = false;
+                nup_source_path.clear();
+                game_list->SetNupConversionRunning(false);
+                if (nup_progress) {
+                    nup_progress->Finish();
+                    nup_progress->deleteLater();
+                    nup_progress = nullptr;
+                }
+                nup_cancel.reset();
+                switch (result) {
+                case FileSys::Music::Result::Success: {
+                    QString text =
+                        tr("%1 track(s) extracted to:\n%2")
+                            .arg(summary.files_ok)
+                            .arg(QString::fromStdString(Common::FS::PathToUTF8String(out_dir)));
+                    if (summary.duplicates > 0) {
+                        text += tr("\n%1 duplicate track(s) were flagged in manifest.csv.")
+                                    .arg(summary.duplicates);
+                    }
+                    if (summary.files_failed > 0) {
+                        text += tr("\n%1 stream(s) could not be decoded - see manifest.csv.")
+                                    .arg(summary.files_failed);
+                    }
+                    QMessageBox::information(this, tr("Extraction Complete"), text);
+                    break;
+                }
+                case FileSys::Music::Result::Cancelled:
+                    break;
+                case FileSys::Music::Result::InvalidSource:
+                case FileSys::Music::Result::NoMusic:
+                case FileSys::Music::Result::IoError:
                     QMessageBox::critical(this, tr("Extraction Failed"),
                                           QString::fromStdString(error));
                     break;
@@ -5758,7 +5886,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         event->ignore();
         connect(shader_warm_dialog, &ShaderWarmDialog::BuildFinished, this, &MainWindow::close,
                 static_cast<Qt::ConnectionType>(Qt::QueuedConnection | Qt::UniqueConnection |
-                                               Qt::SingleShotConnection));
+                                                Qt::SingleShotConnection));
         shader_warm_dialog->close(); // Stops the build (ShaderWarmDialog::reject)
         return;
     }

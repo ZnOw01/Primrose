@@ -85,8 +85,16 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     ++queued_buffers;
 }
 
-std::vector<s16> SinkStream::ReleaseBuffer(u64 num_samples) {
+std::vector<s16> SinkStream::PopSamples(u64 num_samples) {
     auto samples{samples_buffer.Pop(num_samples)};
+
+    if (samples.size() < num_samples)
+        samples.resize(num_samples, 0);
+    return samples;
+}
+
+std::vector<s16> SinkStream::ReleaseBuffer(u64 num_samples) {
+    auto samples{PopSamples(num_samples)};
 
     // TODO: Up-mix to 6 channels if the game expects it.
     // For audio input this is unlikely to ever be the case though.
@@ -99,8 +107,6 @@ std::vector<s16> SinkStream::ReleaseBuffer(u64 num_samples) {
     for (u32 i = 0; i < samples.size(); i++)
         samples[i] = s16(std::clamp(s32(f32(samples[i]) * volume), min, max));
 
-    if (samples.size() < num_samples)
-        samples.resize(num_samples, 0);
     return samples;
 }
 
@@ -158,6 +164,20 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
 
     if (frames_written > 0) {
         std::memcpy(&last_frame[0], &input_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+    }
+
+    // EDEN_NX2_AUDIO_IN_LEVEL: log the captured peak about every two seconds (is the mic heard?).
+    if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_IN_LEVEL") != nullptr; meter) {
+        for (size_t i = 0; i < frames_written * frame_size; ++i) {
+            level_peak = std::max<s32>(level_peak, std::abs(static_cast<s32>(input_buffer[i])));
+        }
+        level_frames += frames_written;
+        if (level_frames >= TargetSampleRate * 2) {
+            LOG_INFO(Audio, "Audio input peak over {} frames: {} of 32767", level_frames,
+                     level_peak);
+            level_frames = 0;
+            level_peak = 0;
+        }
     }
 
     // update sample counts fuer audio-ins

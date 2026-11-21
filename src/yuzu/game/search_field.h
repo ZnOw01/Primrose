@@ -27,6 +27,8 @@ public:
 private:
     void changeEvent(QEvent*) override;
     void RetranslateUI();
+    void RefreshStyles();
+    void RefreshResultPalette();
 
     class KeyReleaseEater : public QObject {
     public:
@@ -42,6 +44,7 @@ private:
     };
     int visible;
     int total;
+    bool style_refresh_queued = false;
 
     QHBoxLayout* layout_filter = nullptr;
     QTreeView* tree_view = nullptr;

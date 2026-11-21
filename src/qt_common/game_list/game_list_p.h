@@ -13,7 +13,12 @@
 
 #include <QCoreApplication>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QObject>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPalette>
+#include <QPixmapCache>
 #include <QRegularExpression>
 #include <QStandardItem>
 #include <QString>
@@ -24,6 +29,7 @@
 #include "frontend_common/play_time_manager.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
+#include "qt_common/util/game_art.h"
 
 enum class GameListItemType {
     Game = QStandardItem::UserType + 1,
@@ -38,13 +44,101 @@ enum class GameListItemType {
 Q_DECLARE_METATYPE(GameListItemType);
 
 /**
- * Gets the default icon (for games without valid title metadata)
- * @param size The desired width and height of the default icon.
- * @return QPixmap default icon
+ * Placeholder for games without an icon: a controller glyph on a soft tile, tinted with the
+ * current palette's text colour so it follows light and dark themes.
+ * @param size The desired width and height of the icon.
  */
-static QPixmap GetDefaultIcon(u32 size) {
-    QPixmap icon(size, size);
+static QPixmap GetPlaceholderIcon(u32 size) {
+    if (size == 0) {
+        return {};
+    }
+
+    const QPalette palette = QGuiApplication::palette();
+    const QColor text = palette.color(QPalette::Text);
+    const QColor base = palette.color(QPalette::Base);
+    const qreal dpr = qApp->devicePixelRatio();
+    const QString key = QStringLiteral("eglantine-placeholder-%1-%2-%3-%4")
+                            .arg(size)
+                            .arg(text.rgba())
+                            .arg(base.rgba())
+                            .arg(dpr);
+
+    QPixmap icon;
+    if (QPixmapCache::find(key, &icon)) {
+        return icon;
+    }
+
+    // Controller glyph from a 32x32 SVG path.
+    static const QPainterPath glyph = [] {
+        QPainterPath path;
+        path.setFillRule(Qt::WindingFill);
+        path.moveTo(18.901, 32);
+        path.lineTo(23.802, 32);
+        path.cubicTo(28.302, 32, 32, 28.302, 32, 23.802);
+        path.lineTo(32, 8.198);
+        path.cubicTo(32, 3.698, 28.302, 0, 23.802, 0);
+        path.lineTo(18.802, 0);
+        path.cubicTo(18.703, 0, 18.599, 0.099, 18.599, 0.198);
+        path.lineTo(18.599, 31.802);
+        path.cubicTo(18.599, 31.901, 18.698, 32, 18.901, 32);
+        path.closeSubpath();
+        path.moveTo(25, 14.401);
+        path.cubicTo(26.802, 14.401, 28.198, 15.901, 28.198, 17.599);
+        path.cubicTo(28.198, 19.401, 26.698, 20.797, 25, 20.797);
+        path.cubicTo(23.198, 20.797, 21.802, 19.401, 21.802, 17.599);
+        path.cubicTo(21.698, 15.802, 23.198, 14.401, 25, 14.401);
+        path.closeSubpath();
+        path.moveTo(15.198, 0);
+        path.lineTo(8.198, 0);
+        path.cubicTo(3.698, 0, 0, 3.698, 0, 8.198);
+        path.lineTo(0, 23.802);
+        path.cubicTo(0, 28.302, 3.698, 32, 8.198, 32);
+        path.lineTo(15.198, 32);
+        path.cubicTo(15.297, 32, 15.401, 31.901, 15.401, 31.802);
+        path.lineTo(15.401, 0.198);
+        path.cubicTo(15.401, 0.099, 15.302, 0, 15.198, 0);
+        path.closeSubpath();
+        path.moveTo(12.901, 29.401);
+        path.lineTo(8.198, 29.401);
+        path.cubicTo(5.099, 29.401, 2.599, 26.901, 2.599, 23.802);
+        path.lineTo(2.599, 8.198);
+        path.cubicTo(2.599, 5.099, 5.099, 2.599, 8.198, 2.599);
+        path.lineTo(12.802, 2.599);
+        path.closeSubpath();
+        path.moveTo(5, 9.599);
+        path.cubicTo(5, 11.297, 6.302, 12.599, 8, 12.599);
+        path.cubicTo(9.698, 12.599, 11, 11.297, 11, 9.599);
+        path.cubicTo(11, 7.901, 9.698, 6.599, 8, 6.599);
+        path.cubicTo(6.302, 6.599, 5, 7.901, 5, 9.599);
+        path.closeSubpath();
+        return path;
+    }();
+
+    icon = QPixmap(QSize(size, size) * dpr);
+    icon.setDevicePixelRatio(dpr);
     icon.fill(Qt::transparent);
+
+    QPainter painter(&icon);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(Qt::NoPen);
+
+    // Opaque tile, so drop shadows drawn behind icons don't show through.
+    const auto mix = [](int from, int to) { return from + (to - from) * 8 / 100; };
+    painter.setBrush(QColor(mix(base.red(), text.red()), mix(base.green(), text.green()),
+                            mix(base.blue(), text.blue())));
+    const qreal radius = size * 0.12;
+    painter.drawRoundedRect(QRectF(0, 0, size, size), radius, radius);
+
+    const qreal glyph_size = size * 0.5;
+    painter.translate((size - glyph_size) / 2.0, (size - glyph_size) / 2.0);
+    painter.scale(glyph_size / 32.0, glyph_size / 32.0);
+    QColor fg = text;
+    fg.setAlphaF(0.55f);
+    painter.setBrush(fg);
+    painter.drawPath(glyph);
+    painter.end();
+
+    QPixmapCache::insert(key, icon);
     return icon;
 }
 
@@ -80,16 +174,24 @@ public:
     static constexpr int FullPathRole = SortRole + 2;
     static constexpr int ProgramIdRole = SortRole + 3;
     static constexpr int FileTypeRole = SortRole + 4;
+    /// The game's own icon, kept so a custom icon can be reset without a rescan.
+    static constexpr int OriginalIconRole = SortRole + 5;
+    static constexpr int DeveloperRole = SortRole + 6;
+    /// Display version of the newest enabled update, or of the base game.
+    static constexpr int VersionRole = SortRole + 7;
+    /// True when the game is a Switch 2 title.
+    static constexpr int Switch2Role = SortRole + 8;
 
     GameListItemPath() = default;
     GameListItemPath(const QString& game_path, const std::vector<u8>& picture_data,
                      const QString& game_name, const QString& game_type, u64 program_id,
-                     u64 play_time, const QString& patch_versions) {
+                     u64 play_time, const QString& patch_versions, bool is_switch2 = false) {
         setData(type(), TypeRole);
         setData(game_path, FullPathRole);
         setData(game_name, TitleRole);
         setData(qulonglong(program_id), ProgramIdRole);
         setData(game_type, FileTypeRole);
+        setData(is_switch2, Switch2Role);
 
         const auto readable_play_time =
             play_time > 0 ? QObject::tr("Play Time: %1")
@@ -114,13 +216,21 @@ public:
 
         const u32 size = UISettings::values.game_icon_size.GetValue();
 
+        // Without a picture, data() serves a palette-tinted placeholder instead.
         QPixmap picture;
-        if (!picture.loadFromData(picture_data.data(), static_cast<u32>(picture_data.size()))) {
-            picture = GetDefaultIcon(size);
+        if (picture.loadFromData(picture_data.data(), static_cast<u32>(picture_data.size()))) {
+            // The original resolution, for views that draw icons much larger than the setting.
+            setData(picture, OriginalIconRole);
+            setData(picture.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation),
+                    Qt::DecorationRole);
         }
-        picture = picture.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-
-        setData(picture, Qt::DecorationRole);
+        if (QtCommon::GameArt::HasIcon(program_id)) {
+            QPixmap custom(QtCommon::GameArt::IconPath(program_id));
+            if (!custom.isNull()) {
+                setData(custom.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation),
+                        Qt::DecorationRole);
+            }
+        }
     }
 
     int type() const override {
@@ -170,6 +280,14 @@ public:
             default:
                 break;
             }
+        }
+
+        if (role == Qt::DecorationRole) {
+            QVariant picture = GameListItem::data(role);
+            if (!picture.isValid()) {
+                return GetPlaceholderIcon(UISettings::values.game_icon_size.GetValue());
+            }
+            return picture;
         }
 
         return GameListItem::data(role);

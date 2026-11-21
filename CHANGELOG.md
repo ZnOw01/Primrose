@@ -20,6 +20,7 @@ New entries go under `## [Unreleased]`; `tools/ci/bump-version.sh` turns them in
 - Upgraded Non-Builder runners to 26.04
 - Added Nix Builds
 - General performance fixes
+- A random bullet point to trigger ci
 
 ## [0.1.0]
 

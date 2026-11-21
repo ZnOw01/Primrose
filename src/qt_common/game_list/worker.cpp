@@ -166,6 +166,15 @@ void GetMetadataFromControlNCA(const FileSys::PatchManager& patch_manager, const
         });
 }
 
+bool GetPlatformIsSwitch2(const FileSys::VirtualFile& file, u64 program_id) {
+    const QString cached = GetGameListCachedObject(
+        fmt::format("{:016X}", program_id), "switch2.txt", [&file, program_id] {
+            return Loader::IsSwitch2Program(file, program_id) ? QStringLiteral("1")
+                                                              : QStringLiteral("0");
+        });
+    return cached == QStringLiteral("1");
+}
+
 bool HasSupportedFileExtension(const std::string& file_name) {
     const QFileInfo file = QFileInfo(QString::fromStdString(file_name));
     return QtCommon::supported_file_extensions.contains(file.suffix(), Qt::CaseInsensitive);
@@ -264,7 +273,7 @@ QString FormatPatchNameVersions(const FileSys::PatchManager& patch_manager,
 
 QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::string& name,
                                         const std::size_t size, const std::vector<u8>& icon,
-                                        Loader::AppLoader& loader, u64 program_id,
+                                        Loader::AppLoader& loader, u64 program_id, bool is_switch2,
                                         const PlayTime::PlayTimeManager& play_time_manager,
                                         const FileSys::PatchManager& patch) {
     auto const file_type = loader.GetFileType();
@@ -276,8 +285,8 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
         });
 
     FileSys::NACP nacp{};
-    if (file_type == Loader::FileType::NUP &&
-        loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
+    const bool has_nacp = loader.ReadControlData(nacp) == Loader::ResultStatus::Success;
+    if (file_type == Loader::FileType::NUP && has_nacp) {
         const std::string version_string = nacp.GetVersionString();
         if (!version_string.empty()) {
             if (!patch_versions.isEmpty()) {
@@ -288,10 +297,26 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
         }
     }
 
+    QString version = has_nacp ? QString::fromStdString(nacp.GetVersionString()) : QString{};
+    static const QRegularExpression update_regex{QStringLiteral(R"(^Update \(([^)]+)\))")};
+    for (const QString& line : patch_versions.split(QLatin1Char('\n'))) {
+        if (const auto match = update_regex.match(line); match.hasMatch()) {
+            version = match.captured(1);
+            break;
+        }
+    }
+
     u64 play_time = play_time_manager.GetPlayTime(program_id);
+    auto* path_item = new GameListItemPath(FormatGameName(path), icon, QString::fromStdString(name),
+                                           file_type_string, program_id, play_time, patch_versions,
+                                           is_switch2);
+    if (has_nacp) {
+        path_item->setData(QString::fromStdString(nacp.GetDeveloperName()),
+                           GameListItemPath::DeveloperRole);
+    }
+    path_item->setData(version, GameListItemPath::VersionRole);
     return QList<QStandardItem*>{
-        new GameListItemPath(FormatGameName(path), icon, QString::fromStdString(name),
-                             file_type_string, program_id, play_time, patch_versions),
+        path_item,
         new GameListItem(file_type_string),
         new GameListItemSize(size),
         new GameListItemPlayTime(play_time),
@@ -408,7 +433,8 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
         }
 
         auto entry = MakeGameListEntry(file->GetFullPath(), name, file->GetSize(), icon, *loader,
-                                       program_id, play_time_manager, patch);
+                                       program_id, GetPlatformIsSwitch2(file, program_id),
+                                       play_time_manager, patch);
         auto pending = std::make_shared<PendingRow>(std::move(entry));
         RecordEvent([=](GameListModel* model) { model->AddEntry(pending->Release(), parent_dir); });
     }
@@ -461,7 +487,7 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
             std::vector<u64> program_ids;
             loader->ReadProgramIds(program_ids);
 
-            const auto addEntry = [this, physical_name,
+            const auto addEntry = [this, physical_name, file,
                                    parent_dir](std::unique_ptr<Loader::AppLoader>& app_loader,
                                                const u64 id) {
                 std::vector<u8> icon;
@@ -483,7 +509,8 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                 const u64 size = loose_dump ? 0 : Common::FS::GetSize(physical_name);
 
                 auto entry = MakeGameListEntry(physical_name, name, size, icon, *app_loader, id,
-                                               play_time_manager, patch);
+                                               GetPlatformIsSwitch2(file, id), play_time_manager,
+                                               patch);
 
                 if (loose_dump) {
                     entry[GameListModel::COLUMN_SIZE]->setText(tr("Not scanned"));

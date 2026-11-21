@@ -240,7 +240,7 @@ jobs:
       - name: Ping Discord
         if: >-
           (inputs.kind == 'stable' || inputs.kind == 'rc' || inputs.kind == 'daily') &&
-          github.repository == 'Djihads80/Eglantine'
+          github.repository == 'Eglantine-Community/Eglantine'
         shell: bash
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}

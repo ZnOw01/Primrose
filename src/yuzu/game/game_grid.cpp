@@ -57,8 +57,15 @@ void GameGrid::ApplyFilter(const QString& edit_filter_text, GameListModel* model
 void GameGrid::UpdateIconSize() {
     const u32 icon_size = UISettings::values.game_icon_size.GetValue();
 
+    // The cartridge frame is portrait; its cells follow the cartridge's width instead of a
+    // square's, so the grid keeps logical spacing instead of letterboxing every cell.
+    const bool cartridge = UISettings::values.game_icon_borders.GetValue() &&
+                           UISettings::values.game_cartridge_kind.GetValue() == 1;
+    const u32 item_width =
+        cartridge ? u32(qRound(icon_size * GameCard::CartridgeAspect)) : icon_size;
+
     int heightMargin = 0;
-    int widthMargin = 80;
+    int widthMargin = 100;
 
     if (UISettings::values.show_game_name) {
         switch (icon_size) {
@@ -66,7 +73,7 @@ void GameGrid::UpdateIconSize() {
             heightMargin = 65;
             break;
         case 0:
-            widthMargin = 120;
+            widthMargin = 140;
             heightMargin = 120;
             break;
         case 64:
@@ -78,14 +85,18 @@ void GameGrid::UpdateIconSize() {
             break;
         }
     } else {
-        widthMargin = 24;
+        widthMargin = 40;
         heightMargin = 24;
     }
 
     const int view_width = viewport()->width();
 
     const double spacing = 0.01;
-    const int min_item_width = icon_size + widthMargin;
+    // The narrower cartridge frees most of the margin a square needed; keep a floor so the
+    // name text still has room and the cells read spaced without crowding.
+    const int item_margin =
+        cartridge ? std::max(40, widthMargin - int(icon_size - item_width)) : widthMargin;
+    const int min_item_width = int(item_width) + item_margin;
 
     int columns = std::max(1, (view_width - 16) / min_item_width);
     int stretched_width = ((view_width) - (spacing * (columns - 1))) / columns;
